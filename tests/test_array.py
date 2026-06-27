@@ -1,0 +1,113 @@
+import pytest
+from pysol import Array, ArrayElement, Type
+
+
+# ---------------------------------------------------------------------------
+# ArrayElement
+# ---------------------------------------------------------------------------
+
+def test_element_1d_read_write():
+    el = ArrayElement(1, [5], Type.Int)
+    el[3] = 42
+    assert el[3] == 42
+
+
+def test_element_3d_row_major():
+    el = ArrayElement(3, [2, 3, 4], Type.Double)
+    el[1, 2, 3] = 1.5
+    assert el[1, 2, 3] == 1.5
+    assert el[0, 0, 0] == 0.0
+
+
+def test_element_string_type():
+    el = ArrayElement(1, [3], Type.String)
+    el[2] = "hello"
+    assert el[2] == "hello"
+    assert el[0] == ""
+
+
+def test_element_index_out_of_range():
+    el = ArrayElement(2, [4, 4], Type.Float)
+    with pytest.raises(IndexError):
+        _ = el[4, 0]
+
+
+def test_element_wrong_ndims():
+    el = ArrayElement(2, [4, 4], Type.Float)
+    with pytest.raises(IndexError):
+        _ = el[0]  # 1 index for 2-D element
+
+
+# ---------------------------------------------------------------------------
+# Array construction
+# ---------------------------------------------------------------------------
+
+def test_array_1d_example():
+    # Array(1, 1, [10], [10], Type.Float)
+    arr = Array(1, 1, [10], [10], Type.Float)
+    assert arr.n_dims == 1
+    assert arr.n_block_dims == 1
+    assert arr.array_size == [10]
+    assert arr.block_size == [10]
+
+
+def test_array_2d_example():
+    # Array(2, 3, [10, 20], [30, 40, 50], Type.Float)
+    arr = Array(2, 3, [10, 20], [30, 40, 50], Type.Float)
+    assert arr.n_dims == 2
+    assert arr.n_block_dims == 3
+    assert arr.array_size == [10, 20]
+    assert arr.block_size == [30, 40, 50]
+
+
+def test_array_bad_sizes():
+    with pytest.raises(ValueError):
+        Array(2, 1, [10], [5], Type.Int)   # array_size length mismatch
+    with pytest.raises(ValueError):
+        Array(1, 2, [10], [5], Type.Int)   # block_size length mismatch
+
+
+# ---------------------------------------------------------------------------
+# Array element access
+# ---------------------------------------------------------------------------
+
+def test_array_get_returns_element():
+    arr = Array(1, 1, [10], [10], Type.Float)
+    el = arr.get(0, [3])
+    assert isinstance(el, ArrayElement)
+    assert el.size == [10]
+
+
+def test_array_bracket_equals_get():
+    arr = Array(1, 1, [10], [10], Type.Float)
+    assert arr[0, 3] is arr.get(0, [3])
+
+
+def test_array_lazy_creation():
+    arr = Array(2, 2, [5, 5], [3, 3], Type.Int)
+    el = arr[0, 1, 2]
+    el[0, 0] = 7
+    assert arr[0, 1, 2][0, 0] == 7
+
+
+# ---------------------------------------------------------------------------
+# Versioning
+# ---------------------------------------------------------------------------
+
+def test_different_versions_are_independent():
+    arr = Array(1, 1, [5], [4], Type.Double)
+    arr[0, 2][1] = 1.0
+    arr[1, 2][1] = 2.0
+    assert arr[0, 2][1] == 1.0
+    assert arr[1, 2][1] == 2.0
+
+
+def test_same_version_same_object():
+    arr = Array(1, 1, [5], [4], Type.Int)
+    assert arr[3, 0] is arr.get(3, [0])
+
+
+def test_array_coord_out_of_range():
+    arr = Array(1, 1, [5], [4], Type.Int)
+    with pytest.raises(IndexError):
+        arr[0, 5]
