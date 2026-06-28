@@ -1,5 +1,5 @@
 import pytest
-from pysol import Array, Type, pysol
+from pysol import Array, NotSupportedIfStatement, NotSupportedLoop, Type, pysol
 from pysol.decorator import _analyse
 
 
@@ -10,6 +10,19 @@ from pysol.decorator import _analyse
 def _run(func):
     """Return the _Analysis of func without executing it."""
     return _analyse(func)
+
+
+# Module-level names referenced inside inner fn() bodies used as AST fixtures.
+# Most of those functions are never actually called — they exist so the linter
+# can resolve every name that appears in the source the decorator will parse.
+a = b = c = x = flag = None
+xs: list = []
+
+def func(*_): return True   # type: ignore[return]
+def check(*_): return True  # type: ignore[return]
+def pred(*_): return True   # type: ignore[return]
+def f(*_): return True      # type: ignore[return]
+def g(*_): return True      # type: ignore[return]
 
 
 # ---------------------------------------------------------------------------
@@ -100,15 +113,50 @@ def test_detects_nested_for_loops():
     assert a.for_loops[1].target == "j"
 
 
-def test_for_loop_tuple_target():
+def test_for_loop_tuple_target_raises():
     def fn():
         for i, j in [(1, 2)]:
             pass
 
-    a = _run(fn)
-    assert len(a.for_loops) == 1
-    assert "i" in a.for_loops[0].target
-    assert "j" in a.for_loops[0].target
+    with pytest.raises(NotSupportedLoop):
+        _run(fn)
+
+
+def test_for_loop_non_range_iterable_raises():
+    def fn():
+        for _ in [1, 2, 3]:
+            pass
+
+    with pytest.raises(NotSupportedLoop):
+        _run(fn)
+
+
+def test_for_loop_variable_iterable_raises():
+    def fn():
+        items = [1, 2, 3]
+        for _ in items:
+            pass
+
+    with pytest.raises(NotSupportedLoop):
+        _run(fn)
+
+
+def test_not_supported_loop_message():
+    def fn():
+        for i, j in [(1, 2)]:
+            pass
+
+    with pytest.raises(NotSupportedLoop, match="only 'for <var> in range"):
+        _run(fn)
+
+
+def test_not_supported_loop_at_decoration_time():
+    def fn():
+        for _ in [1, 2]:
+            pass
+
+    with pytest.raises(NotSupportedLoop):
+        pysol(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +249,198 @@ def test_function_name_in_output(capsys):
 
     my_special_function()
     assert "[pysol] my_special_function" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# If-statement detection
+# ---------------------------------------------------------------------------
+
+def test_detects_valid_if():
+    def fn():
+        if func(a, b):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "func(a, b)"
+
+
+def test_detects_if_no_args():
+    def fn():
+        if check():
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "check()"
+
+
+def test_detects_if_single_var():
+    def fn():
+        if pred(x):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "pred(x)"
+
+
+def test_detects_multiple_if_stmts():
+    def fn():
+        if f(a):
+            pass
+        if g(b, c):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 2
+    assert result.if_stmts[0].condition == "f(a)"
+    assert result.if_stmts[1].condition == "g(b, c)"
+
+
+def test_if_literal_arg_raises():
+    def fn():
+        if check(1):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_expression_arg_raises():
+    def fn():
+        if check(a + b):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+# --- binary comparison forms (now valid) ------------------------------------
+
+def test_if_var_op_var():
+    def fn():
+        if a < b:
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "a < b"
+
+
+def test_if_var_op_const():
+    def fn():
+        if a > 0:
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "a > 0"
+
+
+def test_if_const_op_var():
+    def fn():
+        if 0 < a:
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "0 < a"
+
+
+def test_if_and_operator():
+    def fn():
+        if a and b:
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "a and b"
+
+
+def test_if_or_operator():
+    def fn():
+        if a or b:
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "a or b"
+
+
+# --- still-invalid forms -----------------------------------------------------
+
+def test_if_plain_variable_condition_raises():
+    def fn():
+        if flag:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_nested_call_arg_raises():
+    def fn():
+        if check(len(xs)):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_const_op_const_raises():
+    def fn():
+        if 1 < 2:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_chained_comparison_raises():
+    def fn():
+        if a < b < c:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_three_operand_bool_raises():
+    def fn():
+        if a and b and c:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_not_supported_if_message():
+    def fn():
+        if flag:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement, match="only 'if expr"):
+        _run(fn)
+
+
+def test_not_supported_if_at_decoration_time():
+    def fn():
+        if 1 < 2:
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        pysol(fn)
+
+
+def test_decorator_prints_if_info(capsys):
+    @pysol
+    def fn():
+        if check(a, b):
+            pass
+
+    fn()
+    assert "if check(a, b)" in capsys.readouterr().out
 
 
 def test_sorted_by_line():

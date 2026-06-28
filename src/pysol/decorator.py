@@ -3,9 +3,25 @@ from __future__ import annotations
 import ast
 import functools
 import inspect
+import os
 import textwrap
 from dataclasses import dataclass, field
 from typing import Callable, List
+
+
+# ── Exceptions ──────────────────────────────────────────────────────────────
+
+class NotSupportedLoop(Exception):
+    """Raised at decoration time when a for-loop is not of the form 'for <var> in range(...)'."""
+
+
+class NotSupportedIfStatement(Exception):
+    """Raised at decoration time when an if-condition is not of the form 'expr(v1, ..., vn)'
+    where every argument is a plain variable."""
+
+
+class NotImportedKernel(Exception):
+    """Raised during .sol generation when a call targets a function not imported via import_kernel."""
 
 
 # ── Minimal AST → string (Python 3.8 compatible) ────────────────────────────
@@ -62,6 +78,54 @@ def _target_name(node: ast.AST) -> str:
     return _unparse(node)
 
 
+def _is_range_for(node: ast.For) -> bool:
+    """True iff the loop is exactly: for <single_var> in range(...)"""
+    return (
+        isinstance(node.target, ast.Name)
+        and isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Name)
+        and node.iter.func.id == "range"
+    )
+
+
+def _is_valid_if(node: ast.If) -> bool:
+    """
+    Valid conditions:
+      1. expr(v1, ..., vn)  — call whose every argument is a plain variable
+      2. var op var         — comparison or boolean op between two variables
+      3. var op const       — comparison or boolean op, variable on the left
+      4. const op var       — comparison or boolean op, constant on the left
+    At least one side of a binary expression must be a variable.
+    """
+    test = node.test
+
+    # Form 1: all-variable call
+    if isinstance(test, ast.Call):
+        return all(isinstance(a, ast.Name) for a in test.args) and all(
+            isinstance(kw.value, ast.Name) for kw in test.keywords
+        )
+
+    def _is_atom(n: ast.AST) -> bool:
+        return isinstance(n, (ast.Name, ast.Constant))
+
+    def _valid_binary(left: ast.AST, right: ast.AST) -> bool:
+        return (
+            _is_atom(left)
+            and _is_atom(right)
+            and (isinstance(left, ast.Name) or isinstance(right, ast.Name))
+        )
+
+    # Forms 2–4: single comparison operator  (<, >, <=, >=, ==, !=)
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        return _valid_binary(test.left, test.comparators[0])
+
+    # Forms 2–4: boolean operator with exactly two operands  (and, or)
+    if isinstance(test, ast.BoolOp) and len(test.values) == 2:
+        return _valid_binary(test.values[0], test.values[1])
+
+    return False
+
+
 def _is_array_call(node: ast.AST) -> bool:
     if not isinstance(node, ast.Call):
         return False
@@ -101,11 +165,18 @@ class _WhileInfo:
 
 
 @dataclass
+class _IfInfo:
+    line: int
+    condition: str  # e.g. "func(a, b)"
+
+
+@dataclass
 class _Analysis:
     name: str
     arrays: List[_ArrayInfo] = field(default_factory=list)
     for_loops: List[_ForInfo] = field(default_factory=list)
     while_loops: List[_WhileInfo] = field(default_factory=list)
+    if_stmts: List[_IfInfo] = field(default_factory=list)
 
 
 # ── Static analysis ──────────────────────────────────────────────────────────
@@ -148,6 +219,12 @@ def _analyse(func: Callable) -> _Analysis:
             analysis.arrays.append(_extract_array(abs_line, _target_name(node.target), node.value))
 
         elif isinstance(node, ast.For):
+            if not _is_range_for(node):
+                raise NotSupportedLoop(
+                    f"{func.__name__}: unsupported for-loop at line {abs_line}: "
+                    f"'for {_target_name(node.target)} in {_unparse(node.iter)}' — "
+                    f"only 'for <var> in range(...)' is allowed"
+                )
             analysis.for_loops.append(_ForInfo(
                 line=abs_line,
                 target=_target_name(node.target),
@@ -160,9 +237,22 @@ def _analyse(func: Callable) -> _Analysis:
                 condition=_unparse(node.test),
             ))
 
+        elif isinstance(node, ast.If):
+            if not _is_valid_if(node):
+                raise NotSupportedIfStatement(
+                    f"{func.__name__}: unsupported if-statement at line {abs_line}: "
+                    f"'if {_unparse(node.test)}' — "
+                    f"only 'if expr(v1, ..., vn)' with variable arguments is allowed"
+                )
+            analysis.if_stmts.append(_IfInfo(
+                line=abs_line,
+                condition=_unparse(node.test),
+            ))
+
     analysis.arrays.sort(key=lambda x: x.line)
     analysis.for_loops.sort(key=lambda x: x.line)
     analysis.while_loops.sort(key=lambda x: x.line)
+    analysis.if_stmts.sort(key=lambda x: x.line)
     return analysis
 
 
@@ -190,6 +280,10 @@ def _print_analysis(a: _Analysis) -> None:
     for info in a.while_loops:
         print(f"    line {info.line:<4} while {info.condition}")
 
+    print(f"  If-statements ({len(a.if_stmts)}):")
+    for info in a.if_stmts:
+        print(f"    line {info.line:<4} if {info.condition}")
+
     print(_SEP)
 
 
@@ -197,11 +291,23 @@ def _print_analysis(a: _Analysis) -> None:
 
 def pysol(func: Callable) -> Callable:
     """
-    Decorator that on each call prints pysol.Array declarations, for-loops,
-    and while-loops found in the decorated function's source code.
-    Parsing is done once at decoration time via ast + inspect.
+    Decorator that:
+    - Validates and analyses the function source (ast + inspect) at decoration time.
+    - Writes a <name>.sol file next to the source file at decoration time.
+    - Prints the analysis summary on every call.
     """
     analysis = _analyse(func)
+
+    # Generate .sol file (lazy import avoids circular dependency)
+    from pysol.sol_generator import generate_sol  # noqa: PLC0415
+    sol_content = generate_sol(func, analysis)
+    try:
+        src_dir = os.path.dirname(os.path.abspath(inspect.getfile(func)))
+    except (TypeError, OSError):
+        src_dir = os.getcwd()
+    sol_path = os.path.join(src_dir, f"{func.__name__}.sol")
+    with open(sol_path, "w") as fh:
+        fh.write(sol_content)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):

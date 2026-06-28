@@ -1,6 +1,6 @@
 import inspect
 import pytest
-from pysol import KernelArgument, Type, import_kernel
+from pysol import Array, ArrayElement, KernelArgument, Type, import_kernel
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +140,84 @@ def test_kernel_args_metadata():
     assert len(fn.__kernel_args__) == 2
     assert fn.__kernel_args__[0].name == "x"
     assert fn.__kernel_args__[1].is_input is False
+
+
+# ---------------------------------------------------------------------------
+# KernelArgument — array element
+# ---------------------------------------------------------------------------
+
+def test_array_element_arg_attributes():
+    arg = KernelArgument("blk", True, Type.Float, n_dims=3)
+    assert arg.name == "blk"
+    assert arg.is_input is True
+    assert arg.type is Type.Float
+    assert arg.n_dims == 3
+
+
+def test_array_element_arg_is_array_element_true():
+    arg = KernelArgument("blk", True, Type.Double, n_dims=2)
+    assert arg.is_array_element is True
+
+
+def test_scalar_arg_is_array_element_false():
+    arg = KernelArgument("x", True, Type.Int)
+    assert arg.is_array_element is False
+
+
+def test_array_element_arg_repr():
+    arg = KernelArgument("blk", False, Type.Int, n_dims=2)
+    r = repr(arg)
+    assert "blk" in r
+    assert "out" in r
+    assert "Int" in r
+    assert "n_dims=2" in r
+
+
+def test_scalar_arg_repr_has_no_n_dims():
+    r = repr(KernelArgument("x", True, Type.Float))
+    assert "n_dims" not in r
+
+
+def test_array_element_arg_negative_n_dims_raises():
+    with pytest.raises(ValueError):
+        KernelArgument("blk", True, Type.Float, n_dims=-1)
+
+
+# ---------------------------------------------------------------------------
+# import_kernel — array element signature
+# ---------------------------------------------------------------------------
+
+def test_array_element_annotation_is_array_element():
+    fn = import_kernel("k", [KernelArgument("blk", True, Type.Float, n_dims=2)])
+    assert inspect.signature(fn).parameters["blk"].annotation is ArrayElement
+
+
+def test_mixed_scalar_and_array_element_annotations():
+    args = [
+        KernelArgument("n", True, Type.Int),
+        KernelArgument("blk", True, Type.Double, n_dims=3),
+        KernelArgument("s", False, Type.String),
+    ]
+    fn = import_kernel("k", args)
+    sig = inspect.signature(fn)
+    assert sig.parameters["n"].annotation is int
+    assert sig.parameters["blk"].annotation is ArrayElement
+    assert sig.parameters["s"].annotation is str
+
+
+def test_call_accepts_array_element():
+    fn = import_kernel("k", [KernelArgument("blk", True, Type.Float, n_dims=2)])
+    el = Array(1, 2, [4], [3, 3], Type.Float)[0, 0]
+    fn(el)  # should not raise
+
+
+def test_call_rejects_non_array_element():
+    fn = import_kernel("k", [KernelArgument("blk", True, Type.Int, n_dims=1)])
+    with pytest.raises(TypeError, match="'blk'"):
+        fn(42)
+
+
+def test_call_rejects_wrong_scalar_where_element_expected():
+    fn = import_kernel("k", [KernelArgument("blk", True, Type.Double, n_dims=2)])
+    with pytest.raises(TypeError, match="'blk'"):
+        fn(3.14)

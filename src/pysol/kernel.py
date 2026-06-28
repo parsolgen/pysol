@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Callable, Dict, List
 
+from pysol.array import ArrayElement
 from pysol.types import Type
 
 
@@ -11,28 +12,55 @@ _PY_TYPE: Dict[Type, type] = {
     Type.Float: float,
     Type.Double: float,
     Type.String: str,
+    Type.Bool: bool,
 }
 
 
 class KernelArgument:
-    def __init__(self, name: str, is_input: bool, type: Type) -> None:
+    """
+    Describes one parameter of an imported kernel.
+
+    Scalar argument:       KernelArgument(name, is_input, type)
+    Array-element argument: KernelArgument(name, is_input, type, n_dims=N)  # N >= 1
+
+    When n_dims >= 1 the argument is an ArrayElement; is_array_element is True
+    and the Python annotation used in the generated signature is ArrayElement.
+    The type field still carries the element's scalar type for documentation /
+    code-generation purposes.
+    """
+
+    def __init__(self, name: str, is_input: bool, type: Type, n_dims: int = 0) -> None:
+        if n_dims < 0:
+            raise ValueError(f"n_dims must be >= 0, got {n_dims}")
         self.name = name
         self.is_input = is_input
         self.type = type
+        self.n_dims = n_dims
+
+    @property
+    def is_array_element(self) -> bool:
+        return self.n_dims > 0
 
     def __repr__(self) -> str:
         direction = "in" if self.is_input else "out"
+        if self.is_array_element:
+            return (
+                f"KernelArgument({self.name!r}, {direction}, "
+                f"{self.type.value}, n_dims={self.n_dims})"
+            )
         return f"KernelArgument({self.name!r}, {direction}, {self.type.value})"
 
 
 def import_kernel(name: str, args: List[KernelArgument]) -> Callable:
     """
     Dynamically create and return a callable named `name` whose parameters
-    match `args` with Python types derived from each argument's pysol.Type:
+    match `args`.  Python type annotations per argument:
 
-        Type.Int           → int
-        Type.Float/Double  → float
-        Type.String        → str
+        Scalar  Type.Int           → int
+        Scalar  Type.Float/Double  → float
+        Scalar  Type.String        → str
+        Scalar  Type.Bool          → bool
+        Array element (n_dims>=1)  → ArrayElement
 
     The returned function validates argument types on every call and exposes
     the original KernelArgument metadata via __kernel_args__.
@@ -41,7 +69,7 @@ def import_kernel(name: str, args: List[KernelArgument]) -> Callable:
         inspect.Parameter(
             name=arg.name,
             kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            annotation=_PY_TYPE[arg.type],
+            annotation=ArrayElement if arg.is_array_element else _PY_TYPE[arg.type],
         )
         for arg in args
     ]

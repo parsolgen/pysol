@@ -8,6 +8,7 @@ class Type(Enum):
     Float = "Float"
     Double = "Double"
     String = "String"
+    Bool = "Bool"
 
 
 class ArrayType:
