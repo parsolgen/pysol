@@ -203,52 +203,12 @@ def test_mixed_analysis():
     assert len(a.while_loops) == 1
 
 
-def test_decorator_runs_function(capsys):
+def test_decorator_runs_function():
     @pysol
     def greet():
         return "hello"
 
-    result = greet()
-    assert result == "hello"
-    out = capsys.readouterr().out
-    assert "[pysol] greet" in out
-
-
-def test_decorator_prints_array_info(capsys):
-    @pysol
-    def fn():
-        arr = Array(1, 1, [10], [10], Type.Float)
-
-    fn()
-    out = capsys.readouterr().out
-    assert "arr" in out
-    assert "n_dims=1" in out
-    assert "array_size=[10]" in out
-    assert "Type.Float" in out
-
-
-def test_decorator_prints_loop_info(capsys):
-    @pysol
-    def fn():
-        for i in range(3):
-            pass
-        j = 0
-        while j < 3:
-            j += 1
-
-    fn()
-    out = capsys.readouterr().out
-    assert "for i in range(3)" in out
-    assert "while j < 3" in out
-
-
-def test_function_name_in_output(capsys):
-    @pysol
-    def my_special_function():
-        pass
-
-    my_special_function()
-    assert "[pysol] my_special_function" in capsys.readouterr().out
+    assert greet() == "hello"
 
 
 # ---------------------------------------------------------------------------
@@ -431,16 +391,6 @@ def test_not_supported_if_at_decoration_time():
 
     with pytest.raises(NotSupportedIfStatement):
         pysol(fn)
-
-
-def test_decorator_prints_if_info(capsys):
-    @pysol
-    def fn():
-        if check(a, b):
-            pass
-
-    fn()
-    assert "if check(a, b)" in capsys.readouterr().out
 
 
 def test_sorted_by_line():

@@ -162,7 +162,7 @@ def _gen_import_arg_decl(arg: KernelArgument) -> List[str]:
         return [f"{direction} {sol_type} {arg.name}"]
 
     size_params = [f"{arg.name}_n{i + 1}" for i in range(arg.n_dims)]
-    parts: List[str] = [f"in {sp}" for sp in size_params]
+    parts: List[str] = [f"in int {sp}" for sp in size_params]
     dims = "".join(f"[{sp}]" for sp in size_params)
     parts.append(f"{direction} Array<{sol_type}> {arg.name}{dims}")
     return parts
@@ -378,8 +378,8 @@ class _SolWriter:
         return block_sizes + [ref]
 
     def _get_expansion(self, call: ast.Call) -> List[str]:
+        """array.get(version, [e1, e2, ...]) → [array{version}[e1][e2]...]"""
         array_var: str = call.func.value.id  # type: ignore[attr-defined]
-        block_sizes = _parse_size_list(self._arrays[array_var].block_size)
         version = self._expr(call.args[0])
         coords_node = call.args[1]
         coords = (
@@ -390,7 +390,7 @@ class _SolWriter:
         ref = f"{array_var}{{{version}}}"
         for c in coords:
             ref += f"[{c}]"
-        return block_sizes + [ref]
+        return [ref]
 
     # ── expression generation ─────────────────────────────────────────────────
 

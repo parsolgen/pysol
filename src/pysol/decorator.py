@@ -256,45 +256,12 @@ def _analyse(func: Callable) -> _Analysis:
     return analysis
 
 
-# ── Output ───────────────────────────────────────────────────────────────────
-
-_SEP = "─" * 56
-
-
-def _print_analysis(a: _Analysis) -> None:
-    print(f"\n[pysol] {a.name}")
-    print(_SEP)
-
-    print(f"  Arrays ({len(a.arrays)}):")
-    for info in a.arrays:
-        print(f"    line {info.line:<4} {info.var} = Array(...)")
-        print(f"           n_dims={info.n_dims}  n_block_dims={info.n_block_dims}")
-        print(f"           array_size={info.array_size}  block_size={info.block_size}")
-        print(f"           type={info.elem_type}")
-
-    print(f"  For-loops ({len(a.for_loops)}):")
-    for info in a.for_loops:
-        print(f"    line {info.line:<4} for {info.target} in {info.iterable}")
-
-    print(f"  While-loops ({len(a.while_loops)}):")
-    for info in a.while_loops:
-        print(f"    line {info.line:<4} while {info.condition}")
-
-    print(f"  If-statements ({len(a.if_stmts)}):")
-    for info in a.if_stmts:
-        print(f"    line {info.line:<4} if {info.condition}")
-
-    print(_SEP)
-
-
 # ── Public decorator ─────────────────────────────────────────────────────────
 
 def pysol(func: Callable) -> Callable:
     """
-    Decorator that:
-    - Validates and analyses the function source (ast + inspect) at decoration time.
-    - Writes a <name>.sol file next to the source file at decoration time.
-    - Prints the analysis summary on every call.
+    Decorator that validates and analyses the function source (ast + inspect)
+    at decoration time and writes a <name>.sol file next to the source file.
     """
     analysis = _analyse(func)
 
@@ -311,7 +278,6 @@ def pysol(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        _print_analysis(analysis)
         return func(*args, **kwargs)
 
     return wrapper

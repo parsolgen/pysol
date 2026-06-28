@@ -25,6 +25,12 @@ def _lines(func) -> list:
     return _sol(func).splitlines()
 
 
+# Module-level stubs referenced inside inner fn() bodies used as AST fixtures.
+a = b = i = j = v = var = version = e1 = e2 = flag = None
+
+def check(*_): return True  # type: ignore[return]
+
+
 # ---------------------------------------------------------------------------
 # _parse_size_list
 # ---------------------------------------------------------------------------
@@ -97,22 +103,22 @@ def test_gen_import_arg_scalar_bool():
 
 def test_gen_import_arg_array_element_1d():
     # KernelArgument("a", True, Type.Float, n_dims=1)
-    # → ["in a_n1", "in Array<float> a[a_n1]"]
+    # → ["in int a_n1", "in Array<float> a[a_n1]"]
     decls = _gen_import_arg_decl(KernelArgument("a", True, Type.Float, n_dims=1))
-    assert decls == ["in a_n1", "in Array<float> a[a_n1]"]
+    assert decls == ["in int a_n1", "in Array<float> a[a_n1]"]
 
 
 def test_gen_import_arg_array_element_2d_out():
     # KernelArgument("a", False, Type.Float, n_dims=2)
-    # → ["in a_n1", "in a_n2", "out Array<float> a[a_n1][a_n2]"]
+    # → ["in int a_n1", "in int a_n2", "out Array<float> a[a_n1][a_n2]"]
     decls = _gen_import_arg_decl(KernelArgument("a", False, Type.Float, n_dims=2))
-    assert decls == ["in a_n1", "in a_n2", "out Array<float> a[a_n1][a_n2]"]
+    assert decls == ["in int a_n1", "in int a_n2", "out Array<float> a[a_n1][a_n2]"]
 
 
 def test_gen_import_arg_array_element_3d_double():
     decls = _gen_import_arg_decl(KernelArgument("blk", True, Type.Double, n_dims=3))
     assert decls == [
-        "in blk_n1", "in blk_n2", "in blk_n3",
+        "in int blk_n1", "in int blk_n2", "in int blk_n3",
         "in Array<double> blk[blk_n1][blk_n2][blk_n3]",
     ]
 
@@ -139,7 +145,7 @@ def test_import_with_array_element_arg():
         ])
 
     out = _sol(fn)
-    assert "import process(in a_n1, in a_n2, out Array<float> a[a_n1][a_n2]);" in out
+    assert "import process(in int a_n1, in int a_n2, out Array<float> a[a_n1][a_n2]);" in out
 
 
 def test_import_mixed_scalar_and_array():
@@ -154,7 +160,7 @@ def test_import_mixed_scalar_and_array():
     assert (
         "import kern("
         "in int n, "
-        "in blk_n1, in blk_n2, in blk_n3, out Array<double> blk[blk_n1][blk_n2][blk_n3], "
+        "in int blk_n1, in int blk_n2, in int blk_n3, out Array<double> blk[blk_n1][blk_n2][blk_n3], "
         "in string s"
         ");"
     ) in out
@@ -371,14 +377,36 @@ def test_array_ref_subscript_expansion():
 
 
 def test_array_get_expansion():
-    """arr.get(v, [i, j]) → <block_sizes...>, arr{v}[i][j]"""
+    """arr.get(v, [i, j]) → arr{v}[i][j]  (no block-size prefix)"""
     def fn():
         arr = Array(2, 1, [5, 5], [3], Type.Int)
         k = import_kernel("kern", [])
         k(arr.get(v, [i, j]))
 
     out = _sol(fn)
-    assert "3, arr{v}[i][j]" in out
+    assert "kern(arr{v}[i][j]);" in out
+
+
+def test_array_get_scalar_and_array_args():
+    """kernel(1, var, arr.get(version, [e1, e2])) → kernel(1, var, arr{version}[e1][e2])"""
+    def fn():
+        arr = Array(2, 1, [5, 5], [3], Type.Double)
+        k = import_kernel("kernel", [])
+        k(1, var, arr.get(version, [e1, e2]))
+
+    out = _sol(fn)
+    assert "kernel(1, var, arr{version}[e1][e2]);" in out
+
+
+def test_array_get_single_coord():
+    """arr.get(v, [i]) → arr{v}[i]"""
+    def fn():
+        arr = Array(1, 1, [5], [3], Type.Int)
+        k = import_kernel("kern", [])
+        k(arr.get(v, [i]))
+
+    out = _sol(fn)
+    assert "kern(arr{v}[i]);" in out
 
 
 # ---------------------------------------------------------------------------
