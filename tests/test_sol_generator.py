@@ -453,7 +453,7 @@ def test_annotation_type_int():
 def test_annotation_type_float():
     import ast
     node = ast.parse("x: Type.Float = 0.0", mode="single").body[0]
-    assert _annotation_to_sol_type(node.annotation) == "double"
+    assert _annotation_to_sol_type(node.annotation) == "float"
 
 
 def test_annotation_type_double():
@@ -505,7 +505,7 @@ def test_simple_var_float_annotation():
         y: Type.Float = 1.5
 
     out = _sol(fn)
-    assert "double y = 1.5;" in out
+    assert "float y = 1.5;" in out
 
 
 def test_simple_var_double_annotation():
