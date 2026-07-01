@@ -4,9 +4,11 @@ import textwrap
 
 import pytest
 
-from pysol import Array, KernelArgument, NotImportedKernel, Type, import_kernel, pysol
+import pysol as _pysol_mod
+from pysol import Array, KernelArgument, NotImportedKernel, UnsupportedVariableType, Type, import_kernel, pysol
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
+    _annotation_to_sol_type,
 )
 from pysol.decorator import _analyse
 import ast
@@ -26,7 +28,7 @@ def _lines(func) -> list:
 
 
 # Module-level stubs referenced inside inner fn() bodies used as AST fixtures.
-a = b = i = j = v = var = version = e1 = e2 = flag = None
+a = b = i = j = v = var = version = e1 = e2 = flag = x = y = z = n = None
 
 def check(*_): return True  # type: ignore[return]
 
@@ -436,3 +438,136 @@ def test_sol_file_created(tmp_path, monkeypatch):
     content = sol_file.read_text()
     assert "export sub my_kernel()" in content
     assert "Array<int[5]> arr[5];" in content
+
+
+# ---------------------------------------------------------------------------
+# _annotation_to_sol_type unit tests
+# ---------------------------------------------------------------------------
+
+def test_annotation_type_int():
+    import ast
+    node = ast.parse("x: Type.Int = 0", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "int"
+
+
+def test_annotation_type_float():
+    import ast
+    node = ast.parse("x: Type.Float = 0.0", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "double"
+
+
+def test_annotation_type_double():
+    import ast
+    node = ast.parse("x: Type.Double = 0.0", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "double"
+
+
+def test_annotation_type_string():
+    import ast
+    node = ast.parse("x: Type.String = ''", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "string"
+
+
+def test_annotation_type_bool():
+    import ast
+    node = ast.parse("x: Type.Bool = True", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "bool"
+
+
+def test_annotation_pysol_qualified():
+    """pysol.Type.Int and pysol.Int both map to 'int'."""
+    import ast
+    for src in ("x: pysol.Type.Int = 0", "x: pysol.Int = 0"):
+        node = ast.parse(src, mode="single").body[0]
+        assert _annotation_to_sol_type(node.annotation) == "int", src
+
+
+def test_annotation_unknown_returns_none():
+    import ast
+    node = ast.parse("x: int = 0", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) is None
+
+
+# ---------------------------------------------------------------------------
+# Simple variable declaration generation
+# ---------------------------------------------------------------------------
+
+def test_simple_var_int_annotation():
+    def fn():
+        x: Type.Int = 5
+
+    out = _sol(fn)
+    assert "int x = 5;" in out
+
+
+def test_simple_var_float_annotation():
+    def fn():
+        y: Type.Float = 1.5
+
+    out = _sol(fn)
+    assert "double y = 1.5;" in out
+
+
+def test_simple_var_double_annotation():
+    def fn():
+        z: Type.Double = 3.14
+
+    out = _sol(fn)
+    assert "double z = 3.14;" in out
+
+
+def test_simple_var_string_annotation():
+    def fn():
+        n: Type.String = "hello"
+
+    out = _sol(fn)
+    assert 'string n = "hello";' in out
+
+
+def test_simple_var_bool_annotation_true():
+    def fn():
+        flag: Type.Bool = True
+
+    out = _sol(fn)
+    assert "bool flag = true;" in out
+
+
+def test_simple_var_bool_annotation_false():
+    def fn():
+        flag: Type.Bool = False
+
+    out = _sol(fn)
+    assert "bool flag = false;" in out
+
+
+def test_simple_var_unknown_annotation_raises():
+    def fn():
+        x: int = 42
+
+    with pytest.raises(UnsupportedVariableType, match="'x'"):
+        _sol(fn)
+
+
+def test_simple_var_no_annotation_raises():
+    def fn():
+        x = 42
+
+    with pytest.raises(UnsupportedVariableType, match="'x'"):
+        _sol(fn)
+
+
+def test_unsupported_var_message_lists_supported_types():
+    def fn():
+        x = 42
+
+    with pytest.raises(UnsupportedVariableType, match="Type.Int"):
+        _sol(fn)
+
+
+def test_simple_var_pysol_qualified_annotation():
+    """pysol.Type.Int annotation works the same as Type.Int."""
+    def fn():
+        x: _pysol_mod.Type.Int = 10
+
+    out = _sol(fn)
+    assert "int x = 10;" in out

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import ast
+import ctypes
+import _ctypes
 import functools
 import inspect
 import os
+import subprocess
+import sys
 import textwrap
 from dataclasses import dataclass, field
-from typing import Callable, List
+from typing import Callable, Dict, List, Tuple
+
+from pysol.config import get_config
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -24,6 +30,26 @@ class NotImportedKernel(Exception):
     """Raised during .sol generation when a call targets a function not imported via import_kernel."""
 
 
+class SolLibraryNotFoundError(Exception):
+    """Raised by pysol_run when the .so shared library cannot be found or loaded."""
+
+
+class SolFunctionNotFoundError(Exception):
+    """Raised by pysol_run when the function symbol is absent from the .so shared library."""
+
+
+class SolInitError(Exception):
+    """Raised by pysol_run when init_pslib returns a non-zero error code."""
+
+
+class UnsupportedVariableType(Exception):
+    """Raised during .sol generation when a variable lacks a recognised pysol type annotation."""
+
+
+# ast.Index was removed in Python 3.9; capture it once to avoid deprecation hints
+_AST_INDEX = getattr(ast, "Index", None)
+
+
 # ── Minimal AST → string (Python 3.8 compatible) ────────────────────────────
 
 def _unparse(node: ast.AST) -> str:
@@ -39,8 +65,8 @@ def _unparse(node: ast.AST) -> str:
         return "[" + ", ".join(_unparse(e) for e in node.elts) + "]"
     if isinstance(node, ast.Tuple):
         return "(" + ", ".join(_unparse(e) for e in node.elts) + ")"
-    if hasattr(ast, "Index") and isinstance(node, ast.Index):  # removed in 3.9
-        return _unparse(node.value)  # type: ignore[attr-defined]
+    if _AST_INDEX is not None and isinstance(node, _AST_INDEX):
+        return _unparse(node.value)  # type: ignore[arg-type]
     if isinstance(node, ast.Call):
         args = [_unparse(a) for a in node.args]
         kwargs = [f"{kw.arg}={_unparse(kw.value)}" for kw in node.keywords]
@@ -256,6 +282,11 @@ def _analyse(func: Callable) -> _Analysis:
     return analysis
 
 
+# ── Function registry ────────────────────────────────────────────────────────
+
+_registry: Dict[str, Callable] = {}
+
+
 # ── Public decorator ─────────────────────────────────────────────────────────
 
 def pysol(func: Callable) -> Callable:
@@ -280,4 +311,141 @@ def pysol(func: Callable) -> Callable:
     def wrapper(*args, **kwargs):
         return func(*args, **kwargs)
 
+    wrapper.__pysol_config__ = get_config()
+    wrapper.__pysol_sol_path__ = sol_path
+    _registry[func.__name__] = wrapper
     return wrapper
+
+
+# ── Compiler ──────────────────────────────────────────────────────────────────
+
+def pysol_compile(
+    name: str,
+) -> Tuple[subprocess.CompletedProcess, subprocess.CompletedProcess]:
+    """
+    Compile the .sol file for the @pysol-decorated function called *name*.
+
+    Step 1 — sol → cpp  (requires config key 'sgc'):
+        <sgc> <name>.sol -o <name>.cpp
+
+    Step 2 — sol → shared library  (requires config keys 'compiler' and
+    optionally 'compile_options'):
+        <compiler> <name>.sol [compile_options] -fPIC -shared -o <name>.so
+
+    'compile_options' may be a list of strings or a single space-separated string.
+    Both output files are placed next to the source .sol file.
+
+    Returns a (result_sgc, result_compiler) tuple of CompletedProcess objects.
+
+    Raises:
+      KeyError          – function not registered, or 'sgc'/'compiler' missing from config.
+      FileNotFoundError – binary not found (propagated from subprocess).
+    """
+    if name not in _registry:
+        raise KeyError(f"No @pysol-decorated function named '{name}' registered")
+
+    config = get_config()
+    for required in ("sgc", "compiler"):
+        if required not in config:
+            raise KeyError(
+                f"Config must contain a '{required}' key"
+            )
+
+    sol_path: str = _registry[name].__pysol_sol_path__
+    sol_dir = os.path.dirname(sol_path)
+
+    # Step 1: sgc → .cpp
+    cpp_output = os.path.join(sol_dir, f"{name}.cpp")
+    result_sgc = subprocess.run(
+        [config["sgc"], sol_path, "-o", cpp_output, "--shared=true"],
+        check=False,
+    )
+
+    # Step 2: compiler → .so
+    raw_opts = config.get("compile_options", [])
+    compile_opts: List[str] = (
+        raw_opts if isinstance(raw_opts, list) else raw_opts.split()
+    )
+    so_output = os.path.join(sol_dir, f"{name}.so")
+    result_compiler = subprocess.run(
+        [config["compiler"], cpp_output] + compile_opts + ["-fPIC", "-shared", "-o", so_output],
+        check=False,
+    )
+
+    return result_sgc, result_compiler
+
+
+# ── Runner ────────────────────────────────────────────────────────────────────
+
+def pysol_run(name: str):
+    """
+    Load the shared library <name>.so produced by pysol_compile and invoke
+    the exported C function of the same name.
+
+    The .so is looked up next to the registered .sol file for *name*.
+
+    Raises:
+      KeyError                 – function not registered with @pysol.
+      SolLibraryNotFoundError  – .so file absent or cannot be loaded by the OS.
+      SolFunctionNotFoundError – symbol *name* not exported by the library.
+    """
+    if name not in _registry:
+        raise KeyError(f"No @pysol-decorated function named '{name}' registered")
+
+    sol_path: str = _registry[name].__pysol_sol_path__
+    so_path = os.path.join(os.path.dirname(sol_path), f"{name}.so")
+
+    if not os.path.exists(so_path):
+        raise SolLibraryNotFoundError(
+            f"Shared library not found: '{so_path}'"
+        )
+
+    try:
+        lib = ctypes.CDLL(so_path)
+    except OSError as exc:
+        raise SolLibraryNotFoundError(
+            f"Failed to load shared library '{so_path}': {exc}"
+        ) from exc
+
+    try:
+        init_fn = lib.init_pslib
+    except AttributeError as exc:
+        raise SolFunctionNotFoundError(
+            f"Function 'init_pslib' not found in library '{so_path}'"
+        ) from exc
+
+    try:
+        fini_fn = lib.fini_pslib
+    except AttributeError as exc:
+        raise SolFunctionNotFoundError(
+            f"Function 'fini_pslib' not found in library '{so_path}'"
+        ) from exc
+
+    try:
+        func = getattr(lib, name)
+    except AttributeError as exc:
+        raise SolFunctionNotFoundError(
+            f"Function '{name}' not found in library '{so_path}'"
+        ) from exc
+
+    init_fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+    init_fn.restype = ctypes.c_int
+    fini_fn.restype = None
+
+    argc = len(sys.argv)
+    argv_arr = (ctypes.c_char_p * argc)(*[s.encode() for s in sys.argv])
+    rc = init_fn(argc, argv_arr)
+    if rc != 0:
+        raise SolInitError(
+            f"init_pslib returned error code {rc} for library '{so_path}'"
+        )
+
+    try:
+        result = func()
+    finally:
+        fini_fn()
+        handle = lib._handle
+        del lib
+        _ctypes.dlclose(handle)
+
+    return result

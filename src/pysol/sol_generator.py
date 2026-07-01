@@ -5,8 +5,11 @@ import inspect
 import textwrap
 from typing import Dict, List, Optional, Tuple
 
+_AST_INDEX = getattr(ast, "Index", None)
+
 from pysol.decorator import (
     NotImportedKernel,
+    UnsupportedVariableType,
     _Analysis,
     _ArrayInfo,
     _is_array_call,
@@ -28,7 +31,7 @@ _AST_TYPE_MAP: Dict[str, Type] = {
     "Bool":   Type.Bool,
 }
 
-# Type enum → .sol keyword  (used for code generation)
+# Type enum → .sol keyword  (used for import/array declarations)
 _TYPE_TO_SOL: Dict[Type, str] = {
     Type.Int:    "int",
     Type.Float:  "float",
@@ -36,6 +39,17 @@ _TYPE_TO_SOL: Dict[Type, str] = {
     Type.String: "string",
     Type.Bool:   "bool",
 }
+
+# Variable declarations use a reduced type set: float collapses to double
+_VAR_TYPE_TO_SOL: Dict[Type, str] = {
+    Type.Int:    "int",
+    Type.Float:  "float",
+    Type.Double: "double",
+    Type.String: "string",
+    Type.Bool:   "bool",
+}
+
+_SUPPORTED_VAR_TYPES = ", ".join(f"Type.{t.name}" for t in _VAR_TYPE_TO_SOL)
 
 # Legacy string-keyed map kept for array-declaration generation (_ArrayInfo stores strings)
 _SOL_TYPE: Dict[str, str] = {f"Type.{k}": v for k, v in
@@ -103,6 +117,25 @@ def _ast_to_kernel_arg(node: ast.Call) -> Optional[KernelArgument]:
         return KernelArgument(name, is_input, arg_type, n_dims)
     except ValueError:
         return None
+
+
+def _annotation_to_sol_type(annotation: ast.AST) -> Optional[str]:
+    """
+    Map a Python type annotation to its .sol keyword.
+
+    Handles all of:
+      Type.Int / pysol.Type.Int / pysol.Int  →  "int"
+      Type.Float / pysol.Float               →  "float"
+      etc.
+
+    Returns None for unrecognised annotations.
+    """
+    if not isinstance(annotation, ast.Attribute):
+        return None
+    attr = annotation.attr
+    if attr not in _AST_TYPE_MAP:
+        return None
+    return _VAR_TYPE_TO_SOL[_AST_TYPE_MAP[attr]]
 
 
 def _parse_size_list(size_str: str) -> List[str]:
@@ -234,14 +267,25 @@ class _SolWriter:
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
             var = _target_name(node.targets[0])
-            return [f"{ind}{var} = {self._expr(node.value)};"]
+            raise UnsupportedVariableType(
+                f"Variable '{var}' has no type annotation; "
+                f"supported types are: {_SUPPORTED_VAR_TYPES}"
+            )
 
         if isinstance(node, ast.AnnAssign) and node.value is not None:
             if _is_array_call(node.value):
                 var = _target_name(node.target)
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
-            return []
+            var = _target_name(node.target)
+            sol_type = _annotation_to_sol_type(node.annotation)
+            if sol_type is None:
+                ann_str = _unparse(node.annotation)
+                raise UnsupportedVariableType(
+                    f"Variable '{var}' has unsupported type annotation '{ann_str}'; "
+                    f"supported types are: {_SUPPORTED_VAR_TYPES}"
+                )
+            return [f"{ind}{sol_type} {var} = {self._expr(node.value)};"]
 
         if isinstance(node, ast.AugAssign):
             ops = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}
@@ -335,8 +379,8 @@ class _SolWriter:
 
         while isinstance(cur, ast.Subscript):
             sl = cur.slice
-            if hasattr(ast, "Index") and isinstance(sl, ast.Index):
-                sl = sl.value  # type: ignore[attr-defined]
+            if _AST_INDEX is not None and isinstance(sl, _AST_INDEX):
+                sl = sl.value  # type: ignore[arg-type]
             if isinstance(sl, ast.Tuple):
                 break
             block_idx = [self._expr(sl)] + block_idx
@@ -346,8 +390,8 @@ class _SolWriter:
             return None, None, [], []
 
         inner_sl = cur.slice
-        if hasattr(ast, "Index") and isinstance(inner_sl, ast.Index):
-            inner_sl = inner_sl.value  # type: ignore[attr-defined]
+        if _AST_INDEX is not None and isinstance(inner_sl, _AST_INDEX):
+            inner_sl = inner_sl.value  # type: ignore[arg-type]
 
         if not isinstance(cur.value, ast.Name):
             return None, None, [], []
@@ -434,8 +478,8 @@ class _SolWriter:
             return f"{_unparse(node.func)}({', '.join(args)})"
         if isinstance(node, ast.Subscript):
             sl = node.slice
-            if hasattr(ast, "Index") and isinstance(sl, ast.Index):
-                sl = sl.value  # type: ignore[attr-defined]
+            if _AST_INDEX is not None and isinstance(sl, _AST_INDEX):
+                sl = sl.value  # type: ignore[arg-type]
             idx = (
                 ", ".join(self._expr(e) for e in sl.elts)
                 if isinstance(sl, ast.Tuple)
