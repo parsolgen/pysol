@@ -4,7 +4,7 @@ from pysol.decorator import (
     pysol, pysol_compile, pysol_run,
     NotSupportedLoop, NotSupportedIfStatement, NotImportedKernel,
     SolLibraryNotFoundError, SolFunctionNotFoundError, SolInitError,
-    UnsupportedVariableType,
+    UnsupportedVariableType, ArrayOperationError,
 )
 from pysol.kernel import KernelArgument, import_kernel
 from pysol.config import load_config, get_config
@@ -15,7 +15,7 @@ __all__ = [
     "pysol", "pysol_compile", "pysol_run",
     "NotSupportedLoop", "NotSupportedIfStatement", "NotImportedKernel",
     "SolLibraryNotFoundError", "SolFunctionNotFoundError", "SolInitError",
-    "UnsupportedVariableType",
+    "UnsupportedVariableType", "ArrayOperationError",
     "KernelArgument", "import_kernel",
     "load_config", "get_config",
 ]

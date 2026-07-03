@@ -5,7 +5,7 @@ import textwrap
 import pytest
 
 import pysol as _pysol_mod
-from pysol import Array, KernelArgument, NotImportedKernel, UnsupportedVariableType, Type, import_kernel, pysol
+from pysol import Array, ArrayOperationError, KernelArgument, NotImportedKernel, UnsupportedVariableType, Type, import_kernel, pysol
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
     _annotation_to_sol_type,
@@ -571,3 +571,125 @@ def test_simple_var_pysol_qualified_annotation():
 
     out = _sol(fn)
     assert "int x = 10;" in out
+
+
+# ---------------------------------------------------------------------------
+# Array binary-operation generation
+# ---------------------------------------------------------------------------
+
+def test_array_add_infers_c_type():
+    """C = A + B: C gets same array declaration as A, expression is A + B."""
+    def fn():
+        A = Array(2, 1, [5, 5], [3], Type.Float)
+        B = Array(2, 1, [5, 5], [3], Type.Float)
+        C = A + B
+
+    out = _sol(fn)
+    assert "Array<float[3]> C[5][5] = A + B;" in out
+
+
+def test_array_mul_infers_c_type():
+    """C = A * B: same shape as A."""
+    def fn():
+        A = Array(1, 1, [10], [4], Type.Int)
+        B = Array(1, 1, [10], [4], Type.Int)
+        C = A * B
+
+    out = _sol(fn)
+    assert "Array<int[4]> C[10] = A * B;" in out
+
+
+def test_array_scalar_mul_left():
+    """C = 2 * A: scalar on left, array on right."""
+    def fn():
+        A = Array(1, 1, [8], [4], Type.Float)
+        C = 2 * A
+
+    out = _sol(fn)
+    assert "Array<float[4]> C[8] = 2 * A;" in out
+
+
+def test_array_scalar_mul_right():
+    """C = A * 3: array on left, scalar on right."""
+    def fn():
+        A = Array(1, 1, [6], [2], Type.Double)
+        C = A * 3
+
+    out = _sol(fn)
+    assert "Array<double[2]> C[6] = A * 3;" in out
+
+
+def test_array_binop_c_already_declared():
+    """If C is already declared as an Array, emit plain assignment (no redeclaration)."""
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Int)
+        B = Array(1, 1, [5], [3], Type.Int)
+        C = Array(1, 1, [5], [3], Type.Int)
+        C = A + B
+
+    out = _sol(fn)
+    lines = out.splitlines()
+    decl_lines = [l for l in lines if "Array<int[3]> C" in l]
+    assert len(decl_lines) == 1, "C should only be declared once"
+    assert "C = A + B;" in out
+
+
+def test_array_binop_annotated_uses_array_type():
+    """C: SomeAnnotation = A + B is handled as array binop (annotation ignored)."""
+    def fn():
+        A = Array(1, 2, [4], [2, 3], Type.Double)
+        B = Array(1, 2, [4], [2, 3], Type.Double)
+        C: Type.Double = A + B  # annotation present but overridden by array inference
+
+    out = _sol(fn)
+    assert "Array<double[2][3]> C[4] = A + B;" in out
+
+
+def test_array_add_incompatible_dims_raises():
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Float)
+        B = Array(2, 1, [5, 5], [3], Type.Float)
+        C = A + B
+
+    with pytest.raises(ArrayOperationError, match="n_dims"):
+        _sol(fn)
+
+
+def test_array_add_incompatible_size_raises():
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Float)
+        B = Array(1, 1, [8], [3], Type.Float)
+        C = A + B
+
+    with pytest.raises(ArrayOperationError, match="array_size"):
+        _sol(fn)
+
+
+def test_array_add_incompatible_block_size_raises():
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Float)
+        B = Array(1, 1, [5], [4], Type.Float)
+        C = A + B
+
+    with pytest.raises(ArrayOperationError, match="block_size"):
+        _sol(fn)
+
+
+def test_array_add_incompatible_type_raises():
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Float)
+        B = Array(1, 1, [5], [3], Type.Int)
+        C = A + B
+
+    with pytest.raises(ArrayOperationError, match="type"):
+        _sol(fn)
+
+
+def test_array_add_incompatible_message_names_arrays():
+    def fn():
+        A = Array(1, 1, [5], [3], Type.Float)
+        B = Array(1, 1, [5], [3], Type.Int)
+        C = A + B
+
+    with pytest.raises(ArrayOperationError, match="'A'"):
+        _sol(fn)

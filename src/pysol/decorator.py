@@ -46,6 +46,10 @@ class UnsupportedVariableType(Exception):
     """Raised during .sol generation when a variable lacks a recognised pysol type annotation."""
 
 
+class ArrayOperationError(Exception):
+    """Raised during .sol generation when two array operands are incompatible."""
+
+
 # ast.Index was removed in Python 3.9; capture it once to avoid deprecation hints
 _AST_INDEX = getattr(ast, "Index", None)
 

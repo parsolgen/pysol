@@ -60,6 +60,22 @@ class ArrayElement:
     def __setitem__(self, key, value) -> None:
         self._data[self._flat(key)] = value
 
+    def __add__(self, other: object) -> "ArrayElement":
+        del other
+        return self
+
+    def __radd__(self, other: object) -> "ArrayElement":
+        del other
+        return self
+
+    def __mul__(self, other: object) -> "ArrayElement":
+        del other
+        return self
+
+    def __rmul__(self, other: object) -> "ArrayElement":
+        del other
+        return self
+
     # ------------------------------------------------------------------
     @property
     def n_dims(self) -> int:
@@ -134,6 +150,22 @@ class Array:
                 f"key must be a tuple (version, *{self._n_dims} coordinates), got {key!r}"
             )
         return self.get(int(key[0]), list(key[1:]))
+
+    def __add__(self, other: object) -> "Array":
+        del other
+        return self
+
+    def __radd__(self, other: object) -> "Array":
+        del other
+        return self
+
+    def __mul__(self, other: object) -> "Array":
+        del other
+        return self
+
+    def __rmul__(self, other: object) -> "Array":
+        del other
+        return self
 
     # ------------------------------------------------------------------
     @property

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 _AST_INDEX = getattr(ast, "Index", None)
 
 from pysol.decorator import (
+    ArrayOperationError,
     NotImportedKernel,
     UnsupportedVariableType,
     _Analysis,
@@ -138,6 +139,26 @@ def _annotation_to_sol_type(annotation: ast.AST) -> Optional[str]:
     return _VAR_TYPE_TO_SOL[_AST_TYPE_MAP[attr]]
 
 
+def _validate_array_operands(a: _ArrayInfo, b: _ArrayInfo) -> None:
+    """Raise ArrayOperationError if A and B differ in any structural property."""
+    mismatches: List[str] = []
+    if a.n_dims != b.n_dims:
+        mismatches.append(f"n_dims ({a.n_dims} vs {b.n_dims})")
+    if a.n_block_dims != b.n_block_dims:
+        mismatches.append(f"n_block_dims ({a.n_block_dims} vs {b.n_block_dims})")
+    if a.array_size != b.array_size:
+        mismatches.append(f"array_size ({a.array_size} vs {b.array_size})")
+    if a.block_size != b.block_size:
+        mismatches.append(f"block_size ({a.block_size} vs {b.block_size})")
+    if a.elem_type != b.elem_type:
+        mismatches.append(f"type ({a.elem_type} vs {b.elem_type})")
+    if mismatches:
+        raise ArrayOperationError(
+            f"Arrays '{a.var}' and '{b.var}' are incompatible: "
+            + ", ".join(mismatches)
+        )
+
+
 def _parse_size_list(size_str: str) -> List[str]:
     """'[30, 40, 50]' → ['30', '40', '50']"""
     s = size_str.strip().lstrip("[").rstrip("]")
@@ -266,6 +287,8 @@ class _SolWriter:
                 var = _target_name(node.targets[0])
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
+            if self._is_array_binop(node.value):
+                return self._array_binop_stmt(node.targets[0], node.value, ind)
             var = _target_name(node.targets[0])
             raise UnsupportedVariableType(
                 f"Variable '{var}' has no type annotation; "
@@ -277,6 +300,8 @@ class _SolWriter:
                 var = _target_name(node.target)
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
+            if self._is_array_binop(node.value):
+                return self._array_binop_stmt(node.target, node.value, ind)
             var = _target_name(node.target)
             sol_type = _annotation_to_sol_type(node.annotation)
             if sol_type is None:
@@ -494,11 +519,59 @@ class _SolWriter:
 
     # ── array declaration ─────────────────────────────────────────────────────
 
-    def _array_decl(self, info: _ArrayInfo) -> str:
+    def _array_decl_prefix(self, info: _ArrayInfo) -> str:
+        """Type + varname + dims, no trailing semicolon — used for plain decls and decl+assign."""
         c_type = _SOL_TYPE.get(info.elem_type, info.elem_type)
         block_dims = "".join(f"[{s}]" for s in _parse_size_list(info.block_size))
         array_dims = "".join(f"[{s}]" for s in _parse_size_list(info.array_size))
-        return f"Array<{c_type}{block_dims}> {info.var}{array_dims};"
+        return f"Array<{c_type}{block_dims}> {info.var}{array_dims}"
+
+    def _array_decl(self, info: _ArrayInfo) -> str:
+        return self._array_decl_prefix(info) + ";"
+
+    # ── array binary-operation statement ─────────────────────────────────────
+
+    def _is_array_binop(self, node: ast.AST) -> bool:
+        """True when node is A+B, A*B, const*A, or A*const with at least one known array."""
+        if not isinstance(node, ast.BinOp):
+            return False
+        if not isinstance(node.op, (ast.Add, ast.Mult)):
+            return False
+        left, right = node.left, node.right
+        left_arr  = isinstance(left,  ast.Name) and left.id  in self._arrays
+        right_arr = isinstance(right, ast.Name) and right.id in self._arrays
+        left_const  = isinstance(left,  ast.Constant)
+        right_const = isinstance(right, ast.Constant)
+        return (left_arr and right_arr) or (left_const and right_arr) or (left_arr and right_const)
+
+    def _array_binop_stmt(self, target: ast.AST, binop: ast.BinOp, ind: str) -> List[str]:
+        var = _target_name(target)
+        left, right = binop.left, binop.right
+        op_str = "+" if isinstance(binop.op, ast.Add) else "*"
+
+        left_name  = left.id  if isinstance(left,  ast.Name) and left.id  in self._arrays else None
+        right_name = right.id if isinstance(right, ast.Name) and right.id in self._arrays else None
+
+        if left_name and right_name:
+            _validate_array_operands(self._arrays[left_name], self._arrays[right_name])
+
+        ref_info = self._arrays[left_name or right_name]  # type: ignore[index]
+        expr = f"{self._expr(left)} {op_str} {self._expr(right)}"
+
+        if var in self._arrays:
+            return [f"{ind}{var} = {expr};"]
+
+        c_info = _ArrayInfo(
+            line=ref_info.line,
+            var=var,
+            n_dims=ref_info.n_dims,
+            n_block_dims=ref_info.n_block_dims,
+            array_size=ref_info.array_size,
+            block_size=ref_info.block_size,
+            elem_type=ref_info.elem_type,
+        )
+        self._arrays[var] = c_info
+        return [f"{ind}{self._array_decl_prefix(c_info)} = {expr};"]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

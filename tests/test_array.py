@@ -111,3 +111,61 @@ def test_array_coord_out_of_range():
     arr = Array(1, 1, [5], [4], Type.Int)
     with pytest.raises(IndexError):
         arr[0, 5]
+
+
+# ---------------------------------------------------------------------------
+# ArrayElement operator overloads
+# ---------------------------------------------------------------------------
+
+def test_array_element_add_returns_element():
+    el = ArrayElement(1, [4], Type.Float)
+    result = el + el
+    assert isinstance(result, ArrayElement)
+
+
+def test_array_element_radd_returns_element():
+    el = ArrayElement(1, [4], Type.Float)
+    result = 1 + el
+    assert isinstance(result, ArrayElement)
+
+
+def test_array_element_mul_returns_element():
+    el = ArrayElement(1, [4], Type.Float)
+    result = el * el
+    assert isinstance(result, ArrayElement)
+
+
+def test_array_element_rmul_returns_element():
+    el = ArrayElement(1, [4], Type.Float)
+    result = 2.0 * el
+    assert isinstance(result, ArrayElement)
+
+
+# ---------------------------------------------------------------------------
+# Array operator overloads
+# ---------------------------------------------------------------------------
+
+def test_array_add_returns_array():
+    a = Array(1, 1, [5], [3], Type.Int)
+    b = Array(1, 1, [5], [3], Type.Int)
+    result = a + b
+    assert isinstance(result, Array)
+
+
+def test_array_radd_returns_array():
+    a = Array(1, 1, [5], [3], Type.Int)
+    result = 1 + a
+    assert isinstance(result, Array)
+
+
+def test_array_mul_returns_array():
+    a = Array(1, 1, [5], [3], Type.Float)
+    b = Array(1, 1, [5], [3], Type.Float)
+    result = a * b
+    assert isinstance(result, Array)
+
+
+def test_array_rmul_returns_array():
+    a = Array(1, 1, [5], [3], Type.Float)
+    result = 3.0 * a
+    assert isinstance(result, Array)

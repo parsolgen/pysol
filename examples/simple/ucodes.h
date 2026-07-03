@@ -16,3 +16,21 @@ void print(int val)
 {
     std::cout << "Val: " << val << "\n";
 }
+
+void init_vec(int ii, int n, float* a)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        a[i] = ii;
+    }
+}
+
+void print_vec(int ii, int n, const float* a)
+{
+    std::cout << "A[" << ii << "]: ";
+    for (int i = 0; i < n; ++i)
+    {
+        std::cout << a[i] << ' ';
+    }
+    std::cout << "\n";
+}
