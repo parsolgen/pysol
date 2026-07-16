@@ -5,7 +5,11 @@ import textwrap
 import pytest
 
 import pysol as _pysol_mod
-from pysol import Array, ArrayOperationError, KernelArgument, NotImportedKernel, UnsupportedVariableType, Type, import_kernel, pysol
+from pysol import (
+    Array, ArrayOperationError, KernelArgument, NotImportedKernel,
+    UnsupportedCallError, UnsupportedVariableType, Type, import_kernel, pysol,
+    pysol_update_array,
+)
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
     _annotation_to_sol_type,
@@ -693,3 +697,296 @@ def test_array_add_incompatible_message_names_arrays():
 
     with pytest.raises(ArrayOperationError, match="'A'"):
         _sol(fn)
+
+
+# ---------------------------------------------------------------------------
+# pysol_update_array .sol generation
+# ---------------------------------------------------------------------------
+
+import pysol.sol_generator as _sol_mod
+
+
+@pytest.fixture(autouse=False)
+def _pat_env(tmp_path, monkeypatch):
+    """Write a two-parameter pattern file and point _EXCHANGE_PATTERN at it."""
+    pat = tmp_path / "update_array.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "copy($src{$src_ver}, $dst{$dst_ver});\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+    yield str(pat)
+
+
+def test_update_array_happy_path(_pat_env):
+    """Valid 2-D source and destination generate the pattern-expanded line."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    out = _sol(fn)
+    assert "copy(A{0}, B{1});" in out
+
+
+def test_update_array_version_expression(_pat_env):
+    """Version arguments are inlined as expressions in the pattern_str."""
+    def fn():
+        A = Array(2, 2, [8, 8], [4, 4], Type.Double)
+        B = Array(2, 2, [8, 8], [4, 4], Type.Double)
+        pysol_update_array(A, 2, B, 3)
+
+    out = _sol(fn)
+    assert "copy(A{2}, B{3});" in out
+
+
+def test_update_array_multiline_pattern(tmp_path, monkeypatch):
+    """Pattern bodies with multiple lines are each emitted at correct indentation."""
+    pat = tmp_path / "multi.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "// update\n"
+        "copy($src{$src_ver}, $dst{$dst_ver});\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Int)
+        B = Array(2, 1, [4, 4], [3], Type.Int)
+        pysol_update_array(A, 0, B, 1)
+
+    lines = _sol(fn).splitlines()
+    body = [l.strip() for l in lines if l.strip() in ("// update", "copy(A{0}, B{1});")]
+    assert body == ["// update", "copy(A{0}, B{1});"]
+
+
+def test_update_array_src_ndims_not_2_raises(_pat_env):
+    """Source array with n_dims != 2 raises UnsupportedCallError."""
+    def fn():
+        A = Array(1, 1, [4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    with pytest.raises(UnsupportedCallError, match="source"):
+        _sol(fn)
+
+
+def test_update_array_dst_ndims_not_2_raises(_pat_env):
+    """Destination array with n_dims != 2 raises UnsupportedCallError."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(3, 1, [4, 4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    with pytest.raises(UnsupportedCallError, match="destination"):
+        _sol(fn)
+
+
+def test_update_array_incompatible_size_raises(_pat_env):
+    """Structurally different arrays raise ArrayOperationError."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [8, 8], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    with pytest.raises(ArrayOperationError, match="array_size"):
+        _sol(fn)
+
+
+def test_update_array_incompatible_type_raises(_pat_env):
+    """Arrays with different element types raise ArrayOperationError."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Int)
+        pysol_update_array(A, 0, B, 1)
+
+    with pytest.raises(ArrayOperationError, match="type"):
+        _sol(fn)
+
+
+def test_update_array_incompatible_block_size_raises(_pat_env):
+    """Arrays with different block_size raise ArrayOperationError."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [5], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    with pytest.raises(ArrayOperationError, match="block_size"):
+        _sol(fn)
+
+
+
+def test_update_array_wrong_arg_count_raises(_pat_env):
+    """Wrong number of arguments raises UnsupportedCallError."""
+    # We test this by directly calling _update_array_stmt via sol generation.
+    # Build a synthetic AST call with only 2 args.
+    import ast
+    from pysol.sol_generator import _SolWriter
+    from pysol.decorator import _ArrayInfo
+
+    src_info = _ArrayInfo(line=1, var="A", n_dims="2", n_block_dims="1",
+                          array_size="[4, 4]", block_size="[3]", elem_type="Type.Float")
+    arrays = {"A": src_info}
+    writer = _SolWriter("fn", ast.parse("pass").body[0],  # type: ignore[arg-type]
+                        {}, arrays)
+
+    call = ast.parse("f(A, 0)").body[0].value  # type: ignore[attr-defined]
+    with pytest.raises(UnsupportedCallError, match="4 positional"):
+        writer._update_array_stmt(call, "    ")
+
+
+def test_update_array_unknown_src_raises(_pat_env):
+    """First argument not a known array raises UnsupportedCallError."""
+    import ast
+    from pysol.sol_generator import _SolWriter
+    from pysol.decorator import _ArrayInfo
+
+    dst_info = _ArrayInfo(line=1, var="B", n_dims="2", n_block_dims="1",
+                          array_size="[4, 4]", block_size="[3]", elem_type="Type.Float")
+    arrays = {"B": dst_info}
+    writer = _SolWriter("fn", ast.parse("pass").body[0],  # type: ignore[arg-type]
+                        {}, arrays)
+
+    call = ast.parse("f(X, 0, B, 1)").body[0].value  # type: ignore[attr-defined]
+    with pytest.raises(UnsupportedCallError, match="source"):
+        writer._update_array_stmt(call, "    ")
+
+
+# ---------------------------------------------------------------------------
+# pysol_update_array — $$declare: hoisting into the sub
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=False)
+def _pat_env_decl(tmp_path, monkeypatch):
+    """Pattern that declares a temp array and uses it in the body."""
+    pat = tmp_path / "decl.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "$$declare: Array<float[3]> tmp[4, 4];\n"
+        "load(tmp, $src{$src_ver});\n"
+        "store($dst{$dst_ver}, tmp);\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+    yield str(pat)
+
+
+def test_declare_hoisted_after_last_array_decl(_pat_env_decl):
+    """$$declare: insertion is after the last referenced array declaration, before body stmts."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    out = _sol(fn)
+    stripped = [l.strip() for l in out.splitlines() if l.strip()]
+    b_decl_idx  = next(i for i, l in enumerate(stripped) if l == "Array<float[3]> B[4][4];")
+    tmp_decl_idx = next(i for i, l in enumerate(stripped) if l == "Array<float[3]> tmp_1[4, 4];")
+    load_idx    = next(i for i, l in enumerate(stripped) if l.startswith("load("))
+    assert b_decl_idx < tmp_decl_idx < load_idx
+
+
+def test_declare_body_uses_renamed_tmp(_pat_env_decl):
+    """Body lines reference the renamed (suffixed) declaration name."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    out = _sol(fn)
+    assert "load(tmp_1, A{0});" in out
+    assert "store(B{1}, tmp_1);" in out
+    assert "tmp;" not in out  # bare un-renamed name must not appear
+
+
+def test_declare_call_number_increments(tmp_path, monkeypatch):
+    """Second pysol_update_array call gets suffix _2."""
+    pat = tmp_path / "two.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "$$declare: int buf;\n"
+        "buf = 0;\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Int)
+        B = Array(2, 1, [4, 4], [3], Type.Int)
+        C = Array(2, 1, [4, 4], [3], Type.Int)
+        pysol_update_array(A, 0, B, 1)
+        pysol_update_array(B, 1, C, 2)
+
+    out = _sol(fn)
+    assert "int buf_1;" in out
+    assert "int buf_2;" in out
+    assert "buf_1 = 0;" in out
+    assert "buf_2 = 0;" in out
+
+
+def test_declare_hoisted_before_first_body_stmt(_pat_env_decl):
+    """Hoisted declarations come before regular body statements in the sub."""
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    out = _sol(fn)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    decl_idx  = next(i for i, l in enumerate(lines) if "tmp_1" in l and "Array" in l)
+    store_idx = next(i for i, l in enumerate(lines) if l.startswith("store("))
+    assert decl_idx < store_idx
+
+
+# ---------------------------------------------------------------------------
+# pysol_update_array — $$type() resolved from array info
+# ---------------------------------------------------------------------------
+
+def test_type_token_resolves_to_sol_type(tmp_path, monkeypatch):
+    """$$type($src) in the pattern is replaced with the .sol type of the source array."""
+    pat = tmp_path / "typed.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "$$declare: Array<$$type($src)[3]> tmp[4, 4];\n"
+        "copy_typed($$type($src), $src{$src_ver}, tmp_1, $dst{$dst_ver});\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Float)
+        B = Array(2, 1, [4, 4], [3], Type.Float)
+        pysol_update_array(A, 0, B, 1)
+
+    out = _sol(fn)
+    assert "Array<float[3]> tmp_1[4, 4];" in out
+    assert "copy_typed(float, A{0}, tmp_1, B{1});" in out
+
+
+def test_type_token_int_type(tmp_path, monkeypatch):
+    """$$type($src) resolves to 'int' for Type.Int arrays."""
+    pat = tmp_path / "t.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "$$type($src) val;\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Int)
+        B = Array(2, 1, [4, 4], [3], Type.Int)
+        pysol_update_array(A, 0, B, 1)
+    assert "int val;" in _sol(fn)
+
+
+def test_type_token_double_type(tmp_path, monkeypatch):
+    """$$type($src) resolves to 'double' for Type.Double arrays."""
+    pat = tmp_path / "t.pat"
+    pat.write_text(
+        'replace "pysol_update_array(src, src_ver, dst, dst_ver)":\n'
+        "$$type($src) val;\n"
+    )
+    monkeypatch.setattr(_sol_mod, "_EXCHANGE_PATTERN", str(pat))
+
+    def fn():
+        A = Array(2, 1, [4, 4], [3], Type.Double)
+        B = Array(2, 1, [4, 4], [3], Type.Double)
+        pysol_update_array(A, 0, B, 1)
+    assert "double val;" in _sol(fn)

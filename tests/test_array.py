@@ -1,5 +1,5 @@
 import pytest
-from pysol import Array, ArrayElement, Type
+from pysol import Array, ArrayElement, Type, pysol_update_array
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +169,19 @@ def test_array_rmul_returns_array():
     a = Array(1, 1, [5], [3], Type.Float)
     result = 3.0 * a
     assert isinstance(result, Array)
+
+
+# ---------------------------------------------------------------------------
+# pysol_update_array
+# ---------------------------------------------------------------------------
+
+def test_pysol_update_array_returns_none():
+    src = Array(1, 1, [5], [3], Type.Int)
+    dst = Array(1, 1, [5], [3], Type.Int)
+    assert pysol_update_array(src, 0, dst, 1) is None
+
+
+def test_pysol_update_array_does_not_raise():
+    src = Array(2, 1, [4, 4], [2], Type.Float)
+    dst = Array(2, 1, [4, 4], [2], Type.Float)
+    pysol_update_array(src, 0, dst, 1)

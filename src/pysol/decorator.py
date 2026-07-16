@@ -6,11 +6,15 @@ import _ctypes
 import functools
 import inspect
 import os
+import re
 import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from pysol.array import Array
 
 from pysol.config import get_config
 
@@ -49,6 +53,13 @@ class UnsupportedVariableType(Exception):
 class ArrayOperationError(Exception):
     """Raised during .sol generation when two array operands are incompatible."""
 
+
+class UnsupportedCallError(Exception):
+    """Raised during .sol generation when a call is not supported (e.g. wrong array dimensionality)."""
+
+
+# Regex matching $$type(array_name) tokens in pattern bodies
+_DOLLAR_TYPE_RE = re.compile(r'\$\$type\((\w+)\)')
 
 # ast.Index was removed in Python 3.9; capture it once to avoid deprecation hints
 _AST_INDEX = getattr(ast, "Index", None)
@@ -453,3 +464,160 @@ def pysol_run(name: str):
         _ctypes.dlclose(handle)
 
     return result
+
+
+# ── Pattern substitution ──────────────────────────────────────────────────────
+
+def _extract_decl_name(decl: str) -> Optional[str]:
+    """Return the declared identifier from a .sol declaration string.
+
+    Handles Array<...> name[...] and primitive-type name forms.
+    """
+    m = re.search(r'>\s*(\w+)\s*\[', decl)
+    if m:
+        return m.group(1)
+    m = re.search(r'(?:int|float|double|string|bool)\s+(\w+)', decl)
+    return m.group(1) if m else None
+
+
+def _pysol_apply_pattern(
+    pattern_str: str,
+    pattern_file: str,
+    call_number: int = 1,
+    array_types: Optional[Dict[str, str]] = None,
+) -> Tuple[str, List[str], List[str]]:
+    """
+    Read *pattern_file* and expand *pattern_str* using the template it defines.
+
+    Pattern file format
+    -------------------
+    First line (header):
+        replace "<call_name>(<param1>, <param2>, ...)":
+    Remaining lines (the body):
+        - ``$pN`` tokens: replaced by the corresponding positional argument
+          from *pattern_str*.  Substitution is longest-first.
+        - ``$$type(name)`` tokens: replaced by the ``.sol`` type keyword of
+          array *name* (looked up from *array_types*).  *name* may itself be a
+          ``$pN`` token — ``$param`` substitution runs first.  Unknown names
+          are left unchanged.
+        - ``$$declare: <decl>;`` lines: the declaration is extracted, its name
+          is suffixed with ``_<call_number>``, and it is added to the returned
+          *hoist* list rather than the body.  All occurrences of the original
+          name in the body are also renamed.
+        - ``$$import <import_string>;`` lines: an ``import <import_string>;``
+          directive is collected in the returned *imports* list.  ``$param``
+          and ``$$type()`` substitution apply before the line is collected.
+
+    Returns
+    -------
+    Tuple[str, List[str], List[str]]
+        ``(body, hoist, imports)`` where *body* is the expanded text,
+        *hoist* is a list of renamed declarations, and *imports* is a list
+        of ``import ...;`` strings to be added near the top of the .sol file.
+    """
+    with open(pattern_file) as fh:
+        lines = fh.read().splitlines()
+
+    if not lines:
+        raise ValueError(f"Pattern file '{pattern_file}' is empty")
+
+    # ── parse header ─────────────────────────────────────────────────────────
+    # Expected: replace "<call_name>(<param1>, <param2>, ...)":
+    header_match = re.match(
+        r'\s*replace\s+"[^(]*\(([^)]*)\)"\s*:',
+        lines[0],
+    )
+    if not header_match:
+        raise ValueError(f"Invalid pattern file header: {lines[0]!r}")
+
+    param_names: List[str] = [
+        p.strip() for p in header_match.group(1).split(',') if p.strip()
+    ]
+
+    # ── parse pattern_str ────────────────────────────────────────────────────
+    call_match = re.match(r'\s*\w+\(([^)]*)\)', pattern_str)
+    if not call_match:
+        raise ValueError(f"Invalid pattern string: {pattern_str!r}")
+
+    actual_args = [a.strip() for a in call_match.group(1).split(',') if a.strip()]
+    if len(actual_args) != len(param_names):
+        raise ValueError(
+            f"Pattern expects {len(param_names)} argument(s) but "
+            f"pattern_str provides {len(actual_args)}"
+        )
+
+    # ── build $param substitution mapping (longest first to avoid prefix clash) ──
+    param_mapping: Dict[str, str] = {
+        f'${name}': arg for name, arg in zip(param_names, actual_args)
+    }
+    param_ordered = sorted(param_mapping.items(), key=lambda kv: -len(kv[0]))
+
+    def _apply_params(s: str) -> str:
+        for placeholder, replacement in param_ordered:
+            s = s.replace(placeholder, replacement)
+        return s
+
+    def _apply_type(s: str) -> str:
+        """Replace $$type(name) with the .sol type of array *name*."""
+        if not array_types:
+            return s
+        def _sub(m: re.Match) -> str:  # type: ignore[type-arg]
+            return array_types.get(m.group(1), m.group(0))
+        return _DOLLAR_TYPE_RE.sub(_sub, s)
+
+    def _process(s: str) -> str:
+        """$param substitution → $$type resolution (in that order)."""
+        return _apply_type(_apply_params(s))
+
+    _DECLARE = '$$declare:'
+    _IMPORT  = '$$import'
+    body_lines = lines[1:]
+
+    # ── pass 1: collect $$declare: names so we can rename them everywhere ──────
+    decl_rename: Dict[str, str] = {}
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped.startswith(_DECLARE):
+            continue
+        decl_str = _process(stripped[len(_DECLARE):].strip())
+        name = _extract_decl_name(decl_str)
+        if name is None:
+            raise ValueError(f"Cannot extract name from declaration: {decl_str!r}")
+        if name not in decl_rename:
+            decl_rename[name] = f"{name}_{call_number}"
+
+    # longest-first to avoid prefix collisions between declared names
+    rename_ordered = sorted(decl_rename.items(), key=lambda kv: -len(kv[0]))
+
+    def _apply_renames(s: str) -> str:
+        for orig, renamed in rename_ordered:
+            s = re.sub(r'\b' + re.escape(orig) + r'\b', renamed, s)
+        return s
+
+    # ── pass 2: produce body, hoist, and imports lists ────────────────────────
+    hoist: List[str] = []
+    imports: List[str] = []
+    result: List[str] = []
+    for line in body_lines:
+        stripped = line.strip()
+        if stripped.startswith(_DECLARE):
+            decl_str = _process(stripped[len(_DECLARE):].strip())
+            hoist.append(_apply_renames(decl_str))
+        elif stripped.startswith(_IMPORT):
+            import_body = _process(stripped[len(_IMPORT):].strip())
+            imports.append(f"import {import_body}")
+        else:
+            result.append(_apply_renames(_process(line)))
+
+    return '\n'.join(result), hoist, imports
+
+
+# ── Array utilities ───────────────────────────────────────────────────────────
+
+def pysol_update_array(
+    source: Array,
+    source_version: int,
+    destination: Array,
+    destination_version: int,
+) -> None:
+    pass

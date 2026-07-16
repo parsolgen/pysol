@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import textwrap
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 _AST_INDEX = getattr(ast, "Index", None)
+
+_EXCHANGE_PATTERN = os.path.join(os.path.dirname(__file__), "exchange.sol")
 
 from pysol.decorator import (
     ArrayOperationError,
     NotImportedKernel,
+    UnsupportedCallError,
     UnsupportedVariableType,
     _Analysis,
     _ArrayInfo,
     _is_array_call,
+    _pysol_apply_pattern,
     _target_name,
     _unparse,
 )
@@ -242,26 +247,57 @@ class _SolWriter:
             var: kargs for var, (_, kargs) in imported_kernels.items()
         }
         self._arrays = arrays
+        self._update_array_call_count: int = 0
+        # Each entry: (referenced_array_vars, hoisted_decl_strings) per call.
+        self._pending_hoists: List[Tuple[List[str], List[str]]] = []
+        self._hoist_imports: List[str] = []
+        self._seen_imports: Set[str] = set()
 
     # ── public ───────────────────────────────────────────────────────────────
 
     def render(self) -> str:
         lines: List[str] = []
 
-        # 1. import declarations
+        # Generate body first — populates _pending_hoists and _hoist_imports.
+        body_lines = self._stmts(self._func_def.body, level=1)
+
+        # Insert each call's hoisted declarations after the last declaration of any
+        # array it references.  Scan original body_lines for insertion positions,
+        # then insert in reverse call order so earlier indices remain stable.
+        positions: List[int] = []
+        for ref_vars, _ in self._pending_hoists:
+            last_idx = -1
+            for i, line in enumerate(body_lines):
+                for var in ref_vars:
+                    if "Array<" in line and (f" {var}[" in line or f" {var};" in line):
+                        last_idx = i
+                        break
+            positions.append(last_idx)
+
+        for k in range(len(self._pending_hoists) - 1, -1, -1):
+            _, hoisted_decls = self._pending_hoists[k]
+            if not hoisted_decls:
+                continue
+            insert_at = positions[k] + 1  # 0 when no array decl was found
+            for j, decl in enumerate(hoisted_decls):
+                body_lines.insert(insert_at + j, "    " + decl)
+
+        # 1. import declarations (kernel imports + $$import-derived)
         for var_name, kernel_name in self._kernels.items():
             kargs = self._kernel_arg_lists.get(var_name, [])
             decls: List[str] = []
             for karg in kargs:
                 decls.extend(_gen_import_arg_decl(karg))
             lines.append(f"import {kernel_name}({', '.join(decls)});")
-        if self._kernels:
+        for imp in self._hoist_imports:
+            lines.append(imp)
+        if self._kernels or self._hoist_imports:
             lines.append("")
 
         # 2. function declaration + body
         lines.append(f"export sub {self._name}()")
         lines.append("{")
-        lines.extend(self._stmts(self._func_def.body, level=1))
+        lines.extend(body_lines)
         lines.append("}")
 
         return "\n".join(lines) + "\n"
@@ -327,7 +363,10 @@ class _SolWriter:
             return self._if(node, level)
 
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            return [ind + self._call_stmt(node.value) + ";"]
+            call = node.value
+            if _unparse(call.func) in ("pysol_update_array", "pysol.pysol_update_array"):
+                return self._update_array_stmt(call, ind)
+            return [ind + self._call_stmt(call) + ";"]
 
         return []
 
@@ -370,6 +409,60 @@ class _SolWriter:
         return lines
 
     # ── call statements ───────────────────────────────────────────────────────
+
+    def _update_array_stmt(self, call: ast.Call, ind: str) -> List[str]:
+        """Handle pysol_update_array(source, source_version, destination, destination_version)."""
+        if len(call.args) != 4:
+            raise UnsupportedCallError(
+                "pysol_update_array expects 4 positional arguments: "
+                "source, source_version, destination, destination_version"
+            )
+        src_arg, src_ver_arg, dst_arg, dst_ver_arg = call.args
+
+        if not isinstance(src_arg, ast.Name) or src_arg.id not in self._arrays:
+            raise UnsupportedCallError(
+                "pysol_update_array: argument 1 (source) must be a known array variable"
+            )
+        if not isinstance(dst_arg, ast.Name) or dst_arg.id not in self._arrays:
+            raise UnsupportedCallError(
+                "pysol_update_array: argument 3 (destination) must be a known array variable"
+            )
+
+        src_info = self._arrays[src_arg.id]
+        dst_info = self._arrays[dst_arg.id]
+
+        if src_info.n_dims != "2":
+            raise UnsupportedCallError(
+                f"pysol_update_array: source array '{src_arg.id}' must have n_dims=2, "
+                f"got n_dims={src_info.n_dims}"
+            )
+        if dst_info.n_dims != "2":
+            raise UnsupportedCallError(
+                f"pysol_update_array: destination array '{dst_arg.id}' must have n_dims=2, "
+                f"got n_dims={dst_info.n_dims}"
+            )
+
+        _validate_array_operands(src_info, dst_info)
+
+        src_ver = self._expr(src_ver_arg)
+        dst_ver = self._expr(dst_ver_arg)
+        pattern_str = (
+            f"pysol_update_array({src_arg.id}, {src_ver}, {dst_arg.id}, {dst_ver})"
+        )
+        array_types = {
+            name: _SOL_TYPE.get(info.elem_type, info.elem_type)
+            for name, info in self._arrays.items()
+        }
+        self._update_array_call_count += 1
+        expanded, hoisted, imports = _pysol_apply_pattern(
+            pattern_str, _EXCHANGE_PATTERN, self._update_array_call_count, array_types
+        )
+        self._pending_hoists.append(([src_arg.id, dst_arg.id], hoisted))
+        for imp in imports:
+            if imp not in self._seen_imports:
+                self._seen_imports.add(imp)
+                self._hoist_imports.append(imp)
+        return [ind + line for line in expanded.splitlines()]
 
     def _call_stmt(self, call: ast.Call) -> str:
         func_str = _unparse(call.func)

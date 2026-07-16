@@ -1,7 +1,7 @@
 
 import os
 import sys
-from pysol import Array, KernelArgument, Type, import_kernel, pysol, pysol_compile, pysol_run, load_config
+from pysol import Array, KernelArgument, Type, import_kernel, pysol, pysol_compile, pysol_run, load_config, pysol_update_array
 
 
 @pysol
@@ -19,7 +19,6 @@ def hello_world():
     A = Array(1, 1, [n], [20], Type.Float)
     B = Array(1, 1, [n], [20], Type.Float)
     C = Array(1, 1, [n], [20], Type.Float)
-    D = Array(1, 1, [n], [20], Type.Float)
     init_k = import_kernel("init_vec", [KernelArgument("i", True, Type.Int), KernelArgument("A", False, Type.Float, 1)])
     for i in range(n):
         init_k(i, A[0, i])
@@ -31,7 +30,13 @@ def hello_world():
     C = A + B
     for i in range(n):
         print_vec_k(i, C[0, i])
-    E = Array(2, 2, [n, n], [10, 10], Type.Float)
+    D = Array(2, 2, [n, n], [n + 2, n + 2], Type.Float)
+    E = Array(2, 2, [n, n], [n + 2, n + 2], Type.Float)
+    pysol_update_array(D, 0, E, 0)
+    it : Type.Int = 1
+    while it < 100:
+        it = it + 1
+    print_k(it)
 
 
 def print_command_line_arguments():
@@ -52,8 +57,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(f"Generated: {sol_path}")
     print("=" * 60)
-    if not os.path.exists("hello_world.so"):
-        pysol_compile("hello_world")
+    #if not os.path.exists("hello_world.so"):
+    pysol_compile("hello_world")
     pysol_run("hello_world")
     with open(sol_path) as fh:
         print(fh.read())
