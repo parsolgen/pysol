@@ -69,6 +69,14 @@ _BIN_OPS = {
     ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
     ast.Mod: "%", ast.FloorDiv: "/",
 }
+# Precedence levels for binary operators (higher = tighter binding).
+_OP_PREC: Dict[type, int] = {
+    ast.Add: 1, ast.Sub: 1,
+    ast.Mult: 2, ast.Div: 2, ast.Mod: 2, ast.FloorDiv: 2,
+}
+# Operators for which `a op (b op c)  !=  (a op b) op c` — right-side child
+# with equal precedence must be parenthesised.
+_NON_COMM_OPS = {ast.Sub, ast.Div, ast.Mod, ast.FloorDiv}
 
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
@@ -247,6 +255,7 @@ class _SolWriter:
             var: kargs for var, (_, kargs) in imported_kernels.items()
         }
         self._arrays = arrays
+        self._declared_vars: Set[str] = set()
         self._update_array_call_count: int = 0
         # Each entry: (referenced_array_vars, hoisted_decl_strings) per call.
         self._pending_hoists: List[Tuple[List[str], List[str]]] = []
@@ -326,6 +335,8 @@ class _SolWriter:
             if self._is_array_binop(node.value):
                 return self._array_binop_stmt(node.targets[0], node.value, ind)
             var = _target_name(node.targets[0])
+            if var in self._declared_vars:
+                return [f"{ind}{var} = {self._expr(node.value)};"]
             raise UnsupportedVariableType(
                 f"Variable '{var}' has no type annotation; "
                 f"supported types are: {_SUPPORTED_VAR_TYPES}"
@@ -339,6 +350,8 @@ class _SolWriter:
             if self._is_array_binop(node.value):
                 return self._array_binop_stmt(node.target, node.value, ind)
             var = _target_name(node.target)
+            if var in self._declared_vars:
+                return [f"{ind}{var} = {self._expr(node.value)};"]
             sol_type = _annotation_to_sol_type(node.annotation)
             if sol_type is None:
                 ann_str = _unparse(node.annotation)
@@ -346,6 +359,7 @@ class _SolWriter:
                     f"Variable '{var}' has unsupported type annotation '{ann_str}'; "
                     f"supported types are: {_SUPPORTED_VAR_TYPES}"
                 )
+            self._declared_vars.add(var)
             return [f"{ind}{sol_type} {var} = {self._expr(node.value)};"]
 
         if isinstance(node, ast.AugAssign):
@@ -479,6 +493,12 @@ class _SolWriter:
             array_var, version, coords, block_idx = self._parse_subscript(node)
             if array_var and array_var in self._arrays:
                 return self._subscript_expansion(array_var, version, coords, block_idx)
+            # Plain subscript A[i][j] with no version tuple — peel to base name.
+            cur: ast.AST = node
+            while isinstance(cur, ast.Subscript):
+                cur = cur.value
+            if isinstance(cur, ast.Name) and cur.id in self._arrays:
+                return self._block_n_args(cur.id) + [self._expr(node)]
 
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -524,6 +544,11 @@ class _SolWriter:
         coords = elts[1:] if elts else []
         return array_var, version, coords, block_idx
 
+    def _block_n_args(self, array_var: str) -> List[str]:
+        """Return [%block_n(array_var, 0), ..., %block_n(array_var, n_block_dims-1)]."""
+        n = int(self._arrays[array_var].n_block_dims)
+        return [f"%block_n({array_var}, {i})" for i in range(n)]
+
     def _subscript_expansion(
         self,
         array_var: str,
@@ -531,16 +556,15 @@ class _SolWriter:
         coords: List[str],
         block_idx: List[str],
     ) -> List[str]:
-        block_sizes = _parse_size_list(self._arrays[array_var].block_size)
         ref = f"{array_var}{{{version or '?'}}}"
         for c in coords:
             ref += f"[{c}]"
         for b in block_idx:
             ref += f"[{b}]"
-        return block_sizes + [ref]
+        return self._block_n_args(array_var) + [ref]
 
     def _get_expansion(self, call: ast.Call) -> List[str]:
-        """array.get(version, [e1, e2, ...]) → [array{version}[e1][e2]...]"""
+        """array.get(version, [e1, e2, ...]) → [%block_n(array, 0), ..., array{version}[e1][e2]...]"""
         array_var: str = call.func.value.id  # type: ignore[attr-defined]
         version = self._expr(call.args[0])
         coords_node = call.args[1]
@@ -552,7 +576,7 @@ class _SolWriter:
         ref = f"{array_var}{{{version}}}"
         for c in coords:
             ref += f"[{c}]"
-        return [ref]
+        return self._block_n_args(array_var) + [ref]
 
     # ── expression generation ─────────────────────────────────────────────────
 
@@ -579,7 +603,16 @@ class _SolWriter:
             return str(node.value)
         if isinstance(node, ast.BinOp):
             op = _BIN_OPS.get(type(node.op), "?")
-            return f"{self._expr(node.left)} {op} {self._expr(node.right)}"
+            pp = _OP_PREC.get(type(node.op), 0)
+            left_str = self._expr(node.left)
+            if isinstance(node.left, ast.BinOp) and _OP_PREC.get(type(node.left.op), 0) < pp:
+                left_str = f"({left_str})"
+            right_str = self._expr(node.right)
+            if isinstance(node.right, ast.BinOp):
+                rp = _OP_PREC.get(type(node.right.op), 0)
+                if rp < pp or (rp == pp and type(node.op) in _NON_COMM_OPS):
+                    right_str = f"({right_str})"
+            return f"{left_str} {op} {right_str}"
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
                 return f"!{self._expr(node.operand)}"

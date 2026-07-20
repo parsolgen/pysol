@@ -46,6 +46,10 @@ class SolInitError(Exception):
     """Raised by pysol_run when init_pslib returns a non-zero error code."""
 
 
+class SolCompileError(Exception):
+    """Raised by pysol_compile when the C++ compiler returns a non-zero exit code."""
+
+
 class UnsupportedVariableType(Exception):
     """Raised during .sol generation when a variable lacks a recognised pysol type annotation."""
 
@@ -386,6 +390,12 @@ def pysol_compile(
         [config["compiler"], cpp_output] + compile_opts + ["-fPIC", "-shared", "-o", so_output],
         check=False,
     )
+
+    if result_compiler.returncode != 0 or not os.path.exists(so_output):
+        raise SolCompileError(
+            f"C++ compiler returned exit code {result_compiler.returncode} "
+            f"and '{so_output}' was not produced"
+        )
 
     return result_sgc, result_compiler
 

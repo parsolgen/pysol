@@ -3,7 +3,7 @@ from pysol.array import Array, ArrayElement
 from pysol.decorator import (
     pysol, pysol_compile, pysol_run, pysol_update_array,
     NotSupportedLoop, NotSupportedIfStatement, NotImportedKernel,
-    SolLibraryNotFoundError, SolFunctionNotFoundError, SolInitError,
+    SolLibraryNotFoundError, SolFunctionNotFoundError, SolInitError, SolCompileError,
     UnsupportedVariableType, ArrayOperationError, UnsupportedCallError,
 )
 from pysol.kernel import KernelArgument, import_kernel
@@ -14,7 +14,7 @@ __all__ = [
     "Array", "ArrayElement",
     "pysol", "pysol_compile", "pysol_run", "pysol_update_array",
     "NotSupportedLoop", "NotSupportedIfStatement", "NotImportedKernel",
-    "SolLibraryNotFoundError", "SolFunctionNotFoundError", "SolInitError",
+    "SolLibraryNotFoundError", "SolFunctionNotFoundError", "SolInitError", "SolCompileError",
     "UnsupportedVariableType", "ArrayOperationError", "UnsupportedCallError",
     "KernelArgument", "import_kernel",
     "load_config", "get_config",

@@ -371,48 +371,80 @@ def test_kernel_call_not_imported_raises():
 # ---------------------------------------------------------------------------
 
 def test_array_ref_subscript_expansion():
-    """a[version, i][j] → <block_sizes...>, a{version}[i][j]"""
+    """a[version, i][j] → %block_n(a, 0), %block_n(a, 1), a{version}[i][j]"""
     def fn():
         arr = Array(1, 2, [10], [4, 8], Type.Float)
         k = import_kernel("kern", [])
         k(arr[version, i][j])
 
     out = _sol(fn)
-    # block sizes 4 and 8 should appear as extra args before the ref
-    assert "4, 8, arr{version}[i][j]" in out
+    assert "%block_n(arr, 0), %block_n(arr, 1), arr{version}[i][j]" in out
 
 
 def test_array_get_expansion():
-    """arr.get(v, [i, j]) → arr{v}[i][j]  (no block-size prefix)"""
+    """arr.get(v, [i, j]) → %block_n(arr, 0), arr{v}[i][j]"""
     def fn():
         arr = Array(2, 1, [5, 5], [3], Type.Int)
         k = import_kernel("kern", [])
         k(arr.get(v, [i, j]))
 
     out = _sol(fn)
-    assert "kern(arr{v}[i][j]);" in out
+    assert "kern(%block_n(arr, 0), arr{v}[i][j]);" in out
 
 
 def test_array_get_scalar_and_array_args():
-    """kernel(1, var, arr.get(version, [e1, e2])) → kernel(1, var, arr{version}[e1][e2])"""
+    """kernel(1, var, arr.get(version, [e1, e2])) → kernel(1, var, %block_n(arr, 0), arr{version}[e1][e2])"""
     def fn():
         arr = Array(2, 1, [5, 5], [3], Type.Double)
         k = import_kernel("kernel", [])
         k(1, var, arr.get(version, [e1, e2]))
 
     out = _sol(fn)
-    assert "kernel(1, var, arr{version}[e1][e2]);" in out
+    assert "kernel(1, var, %block_n(arr, 0), arr{version}[e1][e2]);" in out
 
 
 def test_array_get_single_coord():
-    """arr.get(v, [i]) → arr{v}[i]"""
+    """arr.get(v, [i]) → %block_n(arr, 0), arr{v}[i]"""
     def fn():
         arr = Array(1, 1, [5], [3], Type.Int)
         k = import_kernel("kern", [])
         k(arr.get(v, [i]))
 
     out = _sol(fn)
-    assert "kern(arr{v}[i]);" in out
+    assert "kern(%block_n(arr, 0), arr{v}[i]);" in out
+
+
+def test_plain_subscript_single_index():
+    """arr[i] (no version) → %block_n(arr, 0), arr[i]"""
+    def fn():
+        arr = Array(1, 1, [10], [4], Type.Float)
+        k = import_kernel("kern", [])
+        k(arr[i])
+
+    out = _sol(fn)
+    assert "kern(%block_n(arr, 0), arr[i]);" in out
+
+
+def test_plain_subscript_two_indices():
+    """arr[i][j] (no version, two subscripts) → %block_n * n_block_dims, arr[i][j]"""
+    def fn():
+        arr = Array(2, 2, [5, 5], [3, 3], Type.Double)
+        k = import_kernel("kern", [])
+        k(arr[i][j])
+
+    out = _sol(fn)
+    assert "kern(%block_n(arr, 0), %block_n(arr, 1), arr[i][j]);" in out
+
+
+def test_plain_subscript_mixed_with_scalar_args():
+    """Scalar args around a plain array subscript are passed through unchanged."""
+    def fn():
+        arr = Array(1, 1, [8], [4], Type.Int)
+        k = import_kernel("kern", [])
+        k(n, arr[i], n)
+
+    out = _sol(fn)
+    assert "kern(n, %block_n(arr, 0), arr[i], n);" in out
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +607,103 @@ def test_simple_var_pysol_qualified_annotation():
 
     out = _sol(fn)
     assert "int x = 10;" in out
+
+
+# ---------------------------------------------------------------------------
+# Binary-expression parenthesisation
+# ---------------------------------------------------------------------------
+
+def test_binop_complex_nested_parens():
+    """User's example: dx2*dy2 / (2.0*a*(dx2+dy2)) preserves both paren groups."""
+    def fn():
+        dt: Type.Double = x * y / (2.0 * z * (x + y))
+
+    out = _sol(fn)
+    assert "double dt = x * y / (2.0 * z * (x + y));" in out
+
+
+def test_binop_lower_prec_left_child_gets_parens():
+    """(x + y) * z — addition on the left of multiplication needs parens."""
+    def fn():
+        n: Type.Int = (x + y) * z
+
+    out = _sol(fn)
+    assert "int n = (x + y) * z;" in out
+
+
+def test_binop_higher_prec_right_child_no_parens():
+    """x + y * z — multiplication on the right of addition needs no parens."""
+    def fn():
+        n: Type.Int = x + y * z
+
+    out = _sol(fn)
+    assert "int n = x + y * z;" in out
+
+
+def test_binop_right_div_same_prec_gets_parens():
+    """x / (y / z) — equal-prec right child of / needs parens."""
+    def fn():
+        dt: Type.Double = x / (y / z)
+
+    out = _sol(fn)
+    assert "double dt = x / (y / z);" in out
+
+
+def test_binop_right_sub_same_prec_gets_parens():
+    """x - (y - z) — equal-prec right child of - needs parens."""
+    def fn():
+        n: Type.Int = x - (y - z)
+
+    out = _sol(fn)
+    assert "int n = x - (y - z);" in out
+
+
+def test_binop_right_add_same_prec_no_parens():
+    """x + y + z — right-assoc addition is fine without parens."""
+    def fn():
+        n: Type.Int = x + y + z
+
+    out = _sol(fn)
+    assert "int n = x + y + z;" in out
+
+
+def test_simple_var_bare_reassignment_no_redecl():
+    """Plain x = expr after x: Type.Int = ... emits bare assignment, no second declaration."""
+    def fn():
+        x: Type.Int = 5
+        x = 10
+
+    out = _sol(fn)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    decl_lines = [l for l in lines if "int x" in l]
+    assert decl_lines == ["int x = 5;"]
+    assert "x = 10;" in out
+
+
+def test_simple_var_annotated_reassignment_no_redecl():
+    """x: Type.Int = expr a second time must not re-declare x."""
+    def fn():
+        x: Type.Int = 1
+        x: Type.Int = 2
+
+    out = _sol(fn)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    decl_lines = [l for l in lines if "int x" in l]
+    assert decl_lines == ["int x = 1;"]
+    assert "x = 2;" in out
+
+
+def test_simple_var_reassignment_order():
+    """Declaration comes before the bare reassignment in the output."""
+    def fn():
+        n: Type.Int = 0
+        n = 5
+
+    out = _sol(fn)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    decl_idx   = next(i for i, l in enumerate(lines) if l == "int n = 0;")
+    assign_idx = next(i for i, l in enumerate(lines) if l == "n = 5;")
+    assert decl_idx < assign_idx
 
 
 # ---------------------------------------------------------------------------
