@@ -128,3 +128,24 @@ void calc_main(
 		}
 	}
 }
+
+void init_el3d(int ii, int jj, int kk, int n, int m, int l, double* a)
+{
+	a[0] = ii;
+	a[1] = jj;
+	a[2] = kk;
+	for (int i = 3; i < n * m * l; ++i)
+	{
+		a[i] = -1;
+	}
+}
+
+void print_el3d(int ii, int jj, int kk, int n, int m, int l, const double* a)
+{
+        std::cout << "II: " << ii << ", JJ: " << jj << ", KK: " << kk << "\n";
+        for (int i = 0; i < n * m * l; ++i)
+        {
+        	std::cout << a[i] << ' ';
+        }
+        std::cout << "\n";
+}
