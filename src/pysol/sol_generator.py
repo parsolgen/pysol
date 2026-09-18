@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple
 _AST_INDEX = getattr(ast, "Index", None)
 
 _EXCHANGE_PATTERN = os.path.join(os.path.dirname(__file__), "exchange.sol")
+_EXCHANGE_PATTERN_3D = os.path.join(os.path.dirname(__file__), "exchange_3d.sol")
 
 from pysol.decorator import (
     ArrayOperationError,
@@ -445,15 +446,21 @@ class _SolWriter:
         src_info = self._arrays[src_arg.id]
         dst_info = self._arrays[dst_arg.id]
 
-        if src_info.n_dims != "2":
+        if src_info.n_dims not in ("2", "3"):
             raise UnsupportedCallError(
-                f"pysol_update_array: source array '{src_arg.id}' must have n_dims=2, "
-                f"got n_dims={src_info.n_dims}"
+                f"pysol_update_array: source array '{src_arg.id}' must have n_dims=2 "
+                f"or n_dims=3, got n_dims={src_info.n_dims}"
             )
-        if dst_info.n_dims != "2":
+        if dst_info.n_dims not in ("2", "3"):
             raise UnsupportedCallError(
-                f"pysol_update_array: destination array '{dst_arg.id}' must have n_dims=2, "
-                f"got n_dims={dst_info.n_dims}"
+                f"pysol_update_array: destination array '{dst_arg.id}' must have n_dims=2 "
+                f"or n_dims=3, got n_dims={dst_info.n_dims}"
+            )
+        if src_info.n_dims != dst_info.n_dims:
+            raise UnsupportedCallError(
+                f"pysol_update_array: source array '{src_arg.id}' (n_dims={src_info.n_dims}) "
+                f"and destination array '{dst_arg.id}' (n_dims={dst_info.n_dims}) "
+                "must have matching n_dims"
             )
 
         _validate_array_operands(src_info, dst_info)
@@ -467,9 +474,10 @@ class _SolWriter:
             name: _SOL_TYPE.get(info.elem_type, info.elem_type)
             for name, info in self._arrays.items()
         }
+        pattern_file = _EXCHANGE_PATTERN_3D if src_info.n_dims == "3" else _EXCHANGE_PATTERN
         self._update_array_call_count += 1
         expanded, hoisted, imports = _pysol_apply_pattern(
-            pattern_str, _EXCHANGE_PATTERN, self._update_array_call_count, array_types
+            pattern_str, pattern_file, self._update_array_call_count, array_types
         )
         self._pending_hoists.append(([src_arg.id, dst_arg.id], hoisted))
         for imp in imports:

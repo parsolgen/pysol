@@ -76,7 +76,7 @@ def solver():
             init_el_k(i, j, nb, mb, A[i][j])
 
     it : Type.Int = 0
-    while it < 5000:
+    while it < 10000:
         print_it_k(it)
         for i in range(nb):
             for j in range(mb):
