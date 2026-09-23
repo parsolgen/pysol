@@ -253,3 +253,23 @@ void check_ghost_test3d(int ii, int jj, int kk, int nb, int mb, int lb, int n, i
 	std::cout << "CHECK3D[" << ii << "," << jj << "," << kk << "] mismatches=" << mismatches
 	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
 }
+
+void printv(double v)
+{
+	std::cout << "V = " << v << "\n";
+}
+
+void init_el_3d(int ii, int jj, int kk, int n, int m, int l, double* a)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			for (int k = 0; k < l; ++k)
+			{
+				const auto idx = k * n * m + i * m + j;
+				a[idx] = (ii * jj * kk);
+			}
+		}
+	}
+}

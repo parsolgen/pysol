@@ -1119,3 +1119,153 @@ def test_type_token_double_type(tmp_path, monkeypatch):
         B = Array(2, 1, [4, 4], [3], Type.Double)
         pysol_update_array(A, 0, B, 1)
     assert "double val;" in _sol(fn)
+
+
+# ---------------------------------------------------------------------------
+# Array reduction operators: sum(A) / max(A) / min(A) → reduce(%<op>, A[:]...)
+# ---------------------------------------------------------------------------
+
+def test_reduce_sum_1d():
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Double)
+        s: Type.Double = sum(A)
+
+    out = _sol(fn)
+    assert "double s = reduce(%sum, A[:]);" in out
+
+
+def test_reduce_sum_2d():
+    def fn():
+        A = Array(2, 2, [10, 10], [12, 12], Type.Double)
+        s: Type.Double = sum(A)
+
+    out = _sol(fn)
+    assert "double s = reduce(%sum, A[:][:]);" in out
+
+
+def test_reduce_sum_3d():
+    def fn():
+        A = Array(3, 3, [10, 10, 10], [12, 12, 12], Type.Double)
+        s: Type.Double = sum(A)
+
+    out = _sol(fn)
+    assert "double s = reduce(%sum, A[:][:][:]);" in out
+
+
+def test_reduce_max_1d():
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Float)
+        m: Type.Float = max(A)
+
+    out = _sol(fn)
+    assert "float m = reduce(%max, A[:]);" in out
+
+
+def test_reduce_max_2d():
+    def fn():
+        A = Array(2, 2, [10, 10], [12, 12], Type.Float)
+        m: Type.Float = max(A)
+
+    out = _sol(fn)
+    assert "float m = reduce(%max, A[:][:]);" in out
+
+
+def test_reduce_max_3d():
+    def fn():
+        A = Array(3, 3, [10, 10, 10], [12, 12, 12], Type.Float)
+        m: Type.Float = max(A)
+
+    out = _sol(fn)
+    assert "float m = reduce(%max, A[:][:][:]);" in out
+
+
+def test_reduce_min_1d():
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Int)
+        m: Type.Int = min(A)
+
+    out = _sol(fn)
+    assert "int m = reduce(%min, A[:]);" in out
+
+
+def test_reduce_min_2d():
+    def fn():
+        A = Array(2, 2, [10, 10], [12, 12], Type.Int)
+        m: Type.Int = min(A)
+
+    out = _sol(fn)
+    assert "int m = reduce(%min, A[:][:]);" in out
+
+
+def test_reduce_min_3d():
+    def fn():
+        A = Array(3, 3, [10, 10, 10], [12, 12, 12], Type.Int)
+        m: Type.Int = min(A)
+
+    out = _sol(fn)
+    assert "int m = reduce(%min, A[:][:][:]);" in out
+
+
+def test_reduce_qualified_name():
+    """pysol.sum(A) (Attribute call) is recognised the same as sum(A)."""
+    def fn():
+        A = Array(2, 2, [10, 10], [12, 12], Type.Double)
+        s: Type.Double = pysol.sum(A)
+
+    out = _sol(fn)
+    assert "double s = reduce(%sum, A[:][:]);" in out
+
+
+def test_reduce_nested_in_expression():
+    """reduce() calls compose with the rest of expression generation."""
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Double)
+        s: Type.Double = sum(A) + 1.0
+
+    out = _sol(fn)
+    assert "double s = reduce(%sum, A[:]) + 1.0;" in out
+
+
+def test_reduce_unknown_array_raises():
+    """sum() on a non-array variable raises UnsupportedCallError."""
+    def fn():
+        x: Type.Int = 5
+        s: Type.Int = sum(x)
+
+    with pytest.raises(UnsupportedCallError, match="sum"):
+        _sol(fn)
+
+
+def test_reduce_wrong_arg_count_raises():
+    """sum() called with two arguments raises UnsupportedCallError."""
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Double)
+        B = Array(1, 1, [10], [12], Type.Double)
+        s: Type.Double = sum(A, B)
+
+    with pytest.raises(UnsupportedCallError, match="sum"):
+        _sol(fn)
+
+
+def test_reduce_no_args_raises():
+    """sum() called with no arguments raises UnsupportedCallError."""
+    def fn():
+        s: Type.Int = sum()
+
+    with pytest.raises(UnsupportedCallError, match="sum"):
+        _sol(fn)
+
+
+def test_reduce_unsupported_ndims_raises():
+    """An array with an n_dims outside {1, 2, 3} raises UnsupportedCallError."""
+    from pysol.sol_generator import _SolWriter
+    from pysol.decorator import _ArrayInfo
+
+    info = _ArrayInfo(line=1, var="A", n_dims="4", n_block_dims="1",
+                       array_size="[4, 4, 4, 4]", block_size="[3]", elem_type="Type.Float")
+    writer = _SolWriter("fn", ast.parse("pass").body[0],  # type: ignore[arg-type]
+                         {}, {"A": info})
+
+    call = ast.parse("sum(A)").body[0].value  # type: ignore[attr-defined]
+    with pytest.raises(UnsupportedCallError, match="n_dims"):
+        writer._reduce_expr("sum", call)

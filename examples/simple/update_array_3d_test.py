@@ -9,9 +9,9 @@ from pysol import Array, KernelArgument, Type, import_kernel, pysol, pysol_compi
 # NB/MB/LB must stay in sync with the nb/mb/lb literals inside
 # update_array_3d_test() below — the @pysol AST analysis only understands
 # literals local to the decorated function, not module-level names.
-NB = 3
-MB = 3
-LB = 3
+NB = 4
+MB = 4
+LB = 4
 
 
 @pysol
@@ -40,9 +40,9 @@ def update_array_3d_test():
     # ── body ──────────────────────────────────────────────────────────────────
     hello_world_k()
 
-    nb : Type.Int = 3
-    mb : Type.Int = 3
-    lb : Type.Int = 3
+    nb : Type.Int = 4
+    mb : Type.Int = 4
+    lb : Type.Int = 4
 
     block_n_ : Type.Int = 3
     block_m_ : Type.Int = 3
@@ -55,7 +55,7 @@ def update_array_3d_test():
             for k in range(lb):
                 init_k(i, j, k, A[i][j][k])
 
-    pysol_update_array(A, 0, A, 1)
+    pysol_update_array(A, 0, A, 1)  
 
     for i in range(nb):
         for j in range(mb):

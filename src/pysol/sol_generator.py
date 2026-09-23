@@ -91,6 +91,18 @@ def _is_import_kernel_call(node: ast.AST) -> bool:
     )
 
 
+# Array-reduction operators: sum(A) / max(A) / min(A) → reduce(%<op>, A[:]...[:])
+_REDUCE_OPS = {"sum", "max", "min"}
+
+
+def _reduce_op_name(func: ast.AST) -> Optional[str]:
+    if isinstance(func, ast.Name) and func.id in _REDUCE_OPS:
+        return func.id
+    if isinstance(func, ast.Attribute) and func.attr in _REDUCE_OPS:
+        return func.attr
+    return None
+
+
 def _ast_to_kernel_arg(node: ast.Call) -> Optional[KernelArgument]:
     """
     Parse a KernelArgument(name, is_input, type[, n_dims]) AST call node into
@@ -633,6 +645,9 @@ class _SolWriter:
             op_str = " && " if isinstance(node.op, ast.And) else " || "
             return op_str.join(self._expr(v) for v in node.values)
         if isinstance(node, ast.Call):
+            op = _reduce_op_name(node.func)
+            if op is not None:
+                return self._reduce_expr(op, node)
             args = [self._expr(a) for a in node.args]
             return f"{_unparse(node.func)}({', '.join(args)})"
         if isinstance(node, ast.Subscript):
@@ -650,6 +665,27 @@ class _SolWriter:
         if isinstance(node, ast.Tuple):
             return ", ".join(self._expr(e) for e in node.elts)
         return _unparse(node)
+
+    def _reduce_expr(self, op: str, call: ast.Call) -> str:
+        """sum(A) / max(A) / min(A) → reduce(%<op>, A[:]...[:]) with one [:] per array dim."""
+        if (len(call.args) != 1 or call.keywords
+                or not isinstance(call.args[0], ast.Name)
+                or call.args[0].id not in self._arrays):
+            raise UnsupportedCallError(
+                f"{op}(): expects a single known array variable as its argument"
+            )
+        array_var = call.args[0].id
+        info = self._arrays[array_var]
+        try:
+            ndims = int(info.n_dims)
+        except (TypeError, ValueError):
+            ndims = 0
+        if ndims not in (1, 2, 3):
+            raise UnsupportedCallError(
+                f"{op}(): array '{array_var}' must have n_dims in {{1, 2, 3}}, "
+                f"got n_dims={info.n_dims}"
+            )
+        return f"reduce(%{op}, {array_var}{'[:]' * ndims})"
 
     # ── array declaration ─────────────────────────────────────────────────────
 
