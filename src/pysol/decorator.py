@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import _ctypes
+import dataclasses
 import functools
 import inspect
 import os
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from pysol.array import Array
 
 from pysol.config import get_config
+from pysol.types import Type
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -60,6 +62,10 @@ class ArrayOperationError(Exception):
 
 class UnsupportedCallError(Exception):
     """Raised during .sol generation when a call is not supported (e.g. wrong array dimensionality)."""
+
+
+class UnsupportedStructFieldType(Exception):
+    """Raised by @pysol_struct when a field's annotation isn't Type.Int/Float/Double."""
 
 
 # Regex matching $$type(array_name) tokens in pattern bodies
@@ -172,17 +178,33 @@ def _is_valid_if(node: ast.If) -> bool:
 
 
 def _is_array_call(node: ast.AST) -> bool:
+    """True for either Array(...) or GrowingArray(...) constructor calls."""
     if not isinstance(node, ast.Call):
         return False
     func = node.func
-    return (isinstance(func, ast.Name) and func.id == "Array") or (
-        isinstance(func, ast.Attribute) and func.attr == "Array"
+    name = func.id if isinstance(func, ast.Name) else (
+        func.attr if isinstance(func, ast.Attribute) else None
+    )
+    return name in ("Array", "GrowingArray")
+
+
+def _is_growing_array_call(node: ast.AST) -> bool:
+    """True specifically for GrowingArray(...) constructor calls."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "GrowingArray") or (
+        isinstance(func, ast.Attribute) and func.attr == "GrowingArray"
     )
 
 
 # ── Info containers ──────────────────────────────────────────────────────────
 
+# Array(n_dims, n_block_dims, array_size, block_size, type)
 _ARRAY_PARAMS = ("n_dims", "n_block_dims", "array_size", "block_size", "type")
+# GrowingArray(n_dims, array_size, type) — block dimension is always 1, so it
+# takes no n_block_dims / block_size arguments.
+_GROWING_ARRAY_PARAMS = ("n_dims", "array_size", "type")
 
 
 @dataclass
@@ -194,6 +216,7 @@ class _ArrayInfo:
     array_size: str
     block_size: str
     elem_type: str
+    is_growing: bool = False
 
 
 @dataclass
@@ -227,10 +250,12 @@ class _Analysis:
 # ── Static analysis ──────────────────────────────────────────────────────────
 
 def _extract_array(line: int, var: str, call: ast.Call) -> _ArrayInfo:
-    values = {p: "?" for p in _ARRAY_PARAMS}
+    is_growing = _is_growing_array_call(call)
+    param_names = _GROWING_ARRAY_PARAMS if is_growing else _ARRAY_PARAMS
+    values = {p: "?" for p in param_names}
     for i, arg in enumerate(call.args):
-        if i < len(_ARRAY_PARAMS):
-            values[_ARRAY_PARAMS[i]] = _unparse(arg)
+        if i < len(param_names):
+            values[param_names[i]] = _unparse(arg)
     for kw in call.keywords:
         if kw.arg in values:
             values[kw.arg] = _unparse(kw.value)
@@ -238,10 +263,11 @@ def _extract_array(line: int, var: str, call: ast.Call) -> _ArrayInfo:
         line=line,
         var=var,
         n_dims=values["n_dims"],
-        n_block_dims=values["n_block_dims"],
+        n_block_dims="0" if is_growing else values["n_block_dims"],
         array_size=values["array_size"],
-        block_size=values["block_size"],
+        block_size="[]" if is_growing else values["block_size"],
         elem_type=values["type"],
+        is_growing=is_growing,
     )
 
 
@@ -304,6 +330,47 @@ def _analyse(func: Callable) -> _Analysis:
 # ── Function registry ────────────────────────────────────────────────────────
 
 _registry: Dict[str, Callable] = {}
+
+
+# ── Struct types ──────────────────────────────────────────────────────────────
+
+# Only these scalar types may appear as a @pysol_struct field.
+_STRUCT_FIELD_TYPES = (Type.Int, Type.Float, Type.Double)
+
+# struct class name -> [(field_name, Type), ...] in declaration order.
+_struct_registry: Dict[str, List[Tuple[str, Type]]] = {}
+
+
+def pysol_struct(cls: type) -> type:
+    """
+    Decorator for a plain class that declares a parsolgen struct type, used
+    the same way as @dataclass: every class-level annotation must be one of
+    Type.Int, Type.Float, or Type.Double.
+
+    The decorated class becomes a real @dataclass (so it remains usable as a
+    normal Python object) and is registered by name so that @pysol-decorated
+    functions can reference it as the element type of an Array / GrowingArray,
+    or as a variable's type annotation.
+    """
+    cls = dataclasses.dataclass(cls)
+
+    fields: List[Tuple[str, Type]] = []
+    for f in dataclasses.fields(cls):
+        if f.type not in _STRUCT_FIELD_TYPES:
+            raise UnsupportedStructFieldType(
+                f"pysol_struct '{cls.__name__}': field '{f.name}' has unsupported "
+                f"type {f.type!r}; supported types are Type.Int, Type.Float, Type.Double"
+            )
+        fields.append((f.name, f.type))
+
+    if not fields:
+        raise UnsupportedStructFieldType(
+            f"pysol_struct '{cls.__name__}' declares no fields"
+        )
+
+    cls.__pysol_struct_fields__ = fields
+    _struct_registry[cls.__name__] = fields
+    return cls
 
 
 # ── Public decorator ─────────────────────────────────────────────────────────

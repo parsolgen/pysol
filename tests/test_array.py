@@ -1,5 +1,5 @@
 import pytest
-from pysol import Array, ArrayElement, Type, pysol_update_array
+from pysol import Array, ArrayElement, GrowingArray, Type, pysol_update_array
 
 
 # ---------------------------------------------------------------------------
@@ -185,3 +185,88 @@ def test_pysol_update_array_does_not_raise():
     src = Array(2, 1, [4, 4], [2], Type.Float)
     dst = Array(2, 1, [4, 4], [2], Type.Float)
     pysol_update_array(src, 0, dst, 1)
+
+
+# ---------------------------------------------------------------------------
+# GrowingArray construction
+# ---------------------------------------------------------------------------
+
+def test_growing_array_1d_example():
+    arr = GrowingArray(1, [10], Type.Float)
+    assert arr.n_dims == 1
+    assert arr.array_size == [10]
+    assert arr.type == Type.Float
+
+
+def test_growing_array_3d_example():
+    arr = GrowingArray(3, [10, 20, 30], Type.Double)
+    assert arr.n_dims == 3
+    assert arr.array_size == [10, 20, 30]
+
+
+def test_growing_array_bad_size():
+    with pytest.raises(ValueError):
+        GrowingArray(2, [10], Type.Int)  # array_size length mismatch
+
+
+def test_growing_array_has_no_block_params():
+    """GrowingArray's ctor takes no n_block_dims / block_size — unlike Array."""
+    assert not hasattr(GrowingArray(1, [5], Type.Int), "n_block_dims")
+    assert not hasattr(GrowingArray(1, [5], Type.Int), "block_size")
+
+
+# ---------------------------------------------------------------------------
+# GrowingArray element access
+# ---------------------------------------------------------------------------
+
+def test_growing_array_get_default():
+    arr = GrowingArray(1, [10], Type.Float)
+    assert arr.get(0, [3]) == 0.0
+
+
+def test_growing_array_set_and_get():
+    arr = GrowingArray(1, [10], Type.Int)
+    arr.set(0, [3], 42)
+    assert arr.get(0, [3]) == 42
+
+
+def test_growing_array_bracket_equals_get_set():
+    arr = GrowingArray(2, [5, 5], Type.Double)
+    arr[0, 1, 2] = 3.14
+    assert arr[0, 1, 2] == 3.14
+    assert arr[0, 1, 2] == arr.get(0, [1, 2])
+
+
+def test_growing_array_versions_independent():
+    arr = GrowingArray(1, [5], Type.Double)
+    arr[0, 2] = 1.0
+    arr[1, 2] = 2.0
+    assert arr[0, 2] == 1.0
+    assert arr[1, 2] == 2.0
+
+
+def test_growing_array_coord_out_of_range():
+    arr = GrowingArray(1, [5], Type.Int)
+    with pytest.raises(IndexError):
+        arr[0, 5]
+
+
+def test_growing_array_wrong_key_shape():
+    arr = GrowingArray(2, [5, 5], Type.Int)
+    with pytest.raises(IndexError):
+        _ = arr[0, 1]  # missing one coordinate
+
+
+# ---------------------------------------------------------------------------
+# GrowingArray operator overloads
+# ---------------------------------------------------------------------------
+
+def test_growing_array_add_returns_growing_array():
+    a = GrowingArray(1, [5], Type.Int)
+    b = GrowingArray(1, [5], Type.Int)
+    assert isinstance(a + b, GrowingArray)
+
+
+def test_growing_array_mul_returns_growing_array():
+    a = GrowingArray(1, [5], Type.Float)
+    assert isinstance(a * 2.0, GrowingArray)

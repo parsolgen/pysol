@@ -90,6 +90,93 @@ class ArrayElement:
         return self._type
 
 
+class GrowingArray:
+    """
+    N-dimensional versioned array whose block dimension is always 1 — each
+    (version, *coordinates) cell holds a single scalar value rather than a
+    nested ArrayElement block.
+
+    Indexing:  arr[version, i, j] = value  /  value = arr[version, i, j]
+
+    Example
+    -------
+    arr = GrowingArray(3, [10, 20, 30], Type.Double)
+    arr[0, 1, 2, 3] = 3.14
+    """
+
+    def __init__(self, n_dims: int, array_size: List[int], type: Type) -> None:
+        if len(array_size) != n_dims:
+            raise ValueError(f"array_size must have {n_dims} entries")
+        self._n_dims = n_dims
+        self._array_size = list(array_size)
+        self._type = type
+        self._store: Dict[Tuple, object] = {}
+
+    # ------------------------------------------------------------------
+    def _validate(self, coords: List[int]) -> None:
+        if len(coords) != self._n_dims:
+            raise IndexError(f"expected {self._n_dims} coordinates, got {len(coords)}")
+        for dim, (c, s) in enumerate(zip(coords, self._array_size)):
+            if not (0 <= c < s):
+                raise IndexError(f"coordinate {c} out of range [0, {s}) at dim {dim}")
+
+    def get(self, version: int, coordinates: List[int]):
+        """Return the scalar at (version, *coordinates), defaulting if unset."""
+        self._validate(coordinates)
+        key: Tuple = (version, *coordinates)
+        return self._store.get(key, _DEFAULT[self._type])
+
+    def set(self, version: int, coordinates: List[int], value) -> None:
+        self._validate(coordinates)
+        key: Tuple = (version, *coordinates)
+        self._store[key] = value
+
+    def __getitem__(self, key):
+        """arr[version, i, j, ...]"""
+        if not isinstance(key, tuple) or len(key) != self._n_dims + 1:
+            raise IndexError(
+                f"key must be a tuple (version, *{self._n_dims} coordinates), got {key!r}"
+            )
+        return self.get(int(key[0]), list(key[1:]))
+
+    def __setitem__(self, key, value) -> None:
+        """arr[version, i, j, ...] = value"""
+        if not isinstance(key, tuple) or len(key) != self._n_dims + 1:
+            raise IndexError(
+                f"key must be a tuple (version, *{self._n_dims} coordinates), got {key!r}"
+            )
+        self.set(int(key[0]), list(key[1:]), value)
+
+    def __add__(self, other: object) -> "GrowingArray":
+        del other
+        return self
+
+    def __radd__(self, other: object) -> "GrowingArray":
+        del other
+        return self
+
+    def __mul__(self, other: object) -> "GrowingArray":
+        del other
+        return self
+
+    def __rmul__(self, other: object) -> "GrowingArray":
+        del other
+        return self
+
+    # ------------------------------------------------------------------
+    @property
+    def n_dims(self) -> int:
+        return self._n_dims
+
+    @property
+    def array_size(self) -> List[int]:
+        return list(self._array_size)
+
+    @property
+    def type(self) -> Type:
+        return self._type
+
+
 class Array:
     """
     Blocked N-dimensional versioned array.

@@ -4,6 +4,8 @@
 
 #include <iostream>
 #include <fstream>
+#include <string>
+#include <type_traits>
 #include <mpi.h>
 
 void hello_world_k()
@@ -272,4 +274,65 @@ void init_el_3d(int ii, int jj, int kk, int n, int m, int l, double* a)
 			}
 		}
 	}
+}
+
+// A GrowingArray<T> cell is not a single T value: it is a dynamically
+// growing rts::NonUpdatableGeneralGrowingVectorHolder<N, T>::Element, whose
+// public `data_` member is a std::vector<T> that kernels append to (hence
+// "growing"). Because ucodes.h is included before the struct type generated
+// from a .sol "type T : struct {...};" declaration (itself emitted from a
+// @pysol_struct class), these kernels are written as templates over the
+// element-pointer type instead of naming the concrete struct/Element types
+// directly; the struct type only needs to exist by the time the template is
+// actually instantiated from the generated .cpp, which is always true.
+template <typename ElementT>
+void init_struct_cell3d(int ii, int jj, int kk, ElementT* cell)
+{
+	using S = typename std::decay_t<decltype(cell->data_)>::value_type;
+	cell->data_.emplace_back(S{ii, static_cast<float>(jj), static_cast<double>(kk)});
+}
+
+// Verifies that the cell at (ii, jj, kk) holds exactly the single struct
+// value init_struct_cell3d wrote there, and writes "<mismatches>" to
+// struct3d_<ii>_<jj>_<kk> so the driving Python script can assert a clean
+// pass across every cell.
+template <typename ElementT>
+void check_struct_cell3d(int ii, int jj, int kk, const ElementT* cell)
+{
+	int mismatches = 0;
+	if (cell->data_.size() != 1)
+	{
+		++mismatches;
+	}
+	else
+	{
+		const auto& el = cell->data_[0];
+		if (el.a != ii) ++mismatches;
+		if (el.b != static_cast<float>(jj)) ++mismatches;
+		if (el.c != static_cast<double>(kk)) ++mismatches;
+	}
+
+	std::ofstream of{"struct3d_" + std::to_string(ii) + "_" + std::to_string(jj) + "_" + std::to_string(kk)};
+	of << mismatches << "\n";
+}
+
+// Write the result of a sum()/max()/min() reduction to a file so the driving
+// Python script can compare it against an independently computed expected
+// value and report PASS/FAIL.
+void write_sum_result(double v)
+{
+	std::ofstream of{"reduce_sum_result"};
+	of << v << "\n";
+}
+
+void write_max_result(double v)
+{
+	std::ofstream of{"reduce_max_result"};
+	of << v << "\n";
+}
+
+void write_min_result(double v)
+{
+	std::ofstream of{"reduce_min_result"};
+	of << v << "\n";
 }

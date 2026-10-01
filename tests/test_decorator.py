@@ -1,6 +1,9 @@
 import pytest
-from pysol import Array, NotSupportedIfStatement, NotSupportedLoop, Type, pysol
-from pysol.decorator import _analyse
+from pysol import (
+    Array, NotSupportedIfStatement, NotSupportedLoop, Type, pysol,
+    pysol_struct, UnsupportedStructFieldType,
+)
+from pysol.decorator import _analyse, _struct_registry
 
 
 # ---------------------------------------------------------------------------
@@ -402,3 +405,76 @@ def test_sorted_by_line():
     a = _run(fn)
     lines = [info.line for info in a.arrays]
     assert lines == sorted(lines)
+
+
+# ---------------------------------------------------------------------------
+# @pysol_struct
+# ---------------------------------------------------------------------------
+
+def test_pysol_struct_registers_fields():
+    @pysol_struct
+    class _Vec2Struct:
+        x: Type.Double
+        y: Type.Float
+
+    assert _struct_registry["_Vec2Struct"] == [("x", Type.Double), ("y", Type.Float)]
+
+
+def test_pysol_struct_preserves_declaration_order():
+    @pysol_struct
+    class _OrderedStruct:
+        c: Type.Int
+        a: Type.Double
+        b: Type.Float
+
+    names = [name for name, _ in _struct_registry["_OrderedStruct"]]
+    assert names == ["c", "a", "b"]
+
+
+def test_pysol_struct_returns_usable_dataclass():
+    """The decorated class stays a real, constructible Python object."""
+    @pysol_struct
+    class _PointStruct:
+        x: Type.Double
+        y: Type.Double
+
+    p = _PointStruct(x=1.0, y=2.0)
+    assert p.x == 1.0
+    assert p.y == 2.0
+    assert p == _PointStruct(x=1.0, y=2.0)
+
+
+def test_pysol_struct_exposes_fields_on_class():
+    @pysol_struct
+    class _TaggedStruct:
+        v: Type.Int
+
+    assert _TaggedStruct.__pysol_struct_fields__ == [("v", Type.Int)]
+
+
+def test_pysol_struct_rejects_string_field():
+    with pytest.raises(UnsupportedStructFieldType, match="'s'"):
+        @pysol_struct
+        class _BadStruct:
+            s: Type.String
+
+
+def test_pysol_struct_rejects_bool_field():
+    with pytest.raises(UnsupportedStructFieldType):
+        @pysol_struct
+        class _BadBoolStruct:
+            flag: Type.Bool
+
+
+def test_pysol_struct_rejects_empty_class():
+    with pytest.raises(UnsupportedStructFieldType, match="no fields"):
+        @pysol_struct
+        class _EmptyStruct:
+            pass
+
+
+def test_pysol_struct_message_names_class():
+    with pytest.raises(UnsupportedStructFieldType, match="_NamedBadStruct"):
+        @pysol_struct
+        class _NamedBadStruct:
+            s: Type.String

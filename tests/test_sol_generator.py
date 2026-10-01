@@ -6,9 +6,9 @@ import pytest
 
 import pysol as _pysol_mod
 from pysol import (
-    Array, ArrayOperationError, KernelArgument, NotImportedKernel,
+    Array, ArrayOperationError, GrowingArray, KernelArgument, NotImportedKernel,
     UnsupportedCallError, UnsupportedVariableType, Type, import_kernel, pysol,
-    pysol_update_array,
+    pysol_struct, pysol_update_array,
 )
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
@@ -1269,3 +1269,191 @@ def test_reduce_unsupported_ndims_raises():
     call = ast.parse("sum(A)").body[0].value  # type: ignore[attr-defined]
     with pytest.raises(UnsupportedCallError, match="n_dims"):
         writer._reduce_expr("sum", call)
+
+
+# ---------------------------------------------------------------------------
+# GrowingArray declaration generation
+# ---------------------------------------------------------------------------
+
+def test_growing_array_decl_3d_example():
+    """The spec example: GrowingArray(3, [nb, mb, lb], Type.Double) → GrowingArray<double> A[nb][mb][lb];"""
+    def fn():
+        nb: Type.Int = 10
+        mb: Type.Int = 10
+        lb: Type.Int = 10
+        A = GrowingArray(3, [nb, mb, lb], Type.Double)
+
+    out = _sol(fn)
+    assert "GrowingArray<double> A[nb][mb][lb];" in out
+
+
+def test_growing_array_decl_1d():
+    def fn():
+        G = GrowingArray(1, [10], Type.Int)
+
+    out = _sol(fn)
+    assert "GrowingArray<int> G[10];" in out
+
+
+def test_growing_array_decl_2d():
+    def fn():
+        G = GrowingArray(2, [10, 20], Type.Float)
+
+    out = _sol(fn)
+    assert "GrowingArray<float> G[10][20];" in out
+
+
+def test_growing_array_decl_literal_dims():
+    def fn():
+        G = GrowingArray(3, [4, 5, 6], Type.Double)
+
+    out = _sol(fn)
+    assert "GrowingArray<double> G[4][5][6];" in out
+
+
+def test_growing_array_decl_ann_assign():
+    """AnnAssign form: G: SomeAnnotation = GrowingArray(...) is handled the same as Assign."""
+    def fn():
+        G: Type.Double = GrowingArray(2, [10, 10], Type.Double)
+
+    out = _sol(fn)
+    assert "GrowingArray<double> G[10][10];" in out
+
+
+def test_growing_array_no_block_dims_in_decl():
+    """Unlike Array, the declaration never includes block-size brackets on the type."""
+    def fn():
+        G = GrowingArray(1, [10], Type.Double)
+
+    out = _sol(fn)
+    assert "GrowingArray<double[" not in out
+
+
+def test_growing_array_alongside_regular_array():
+    """GrowingArray and Array declarations coexist and keep their own forms."""
+    def fn():
+        A = Array(1, 1, [10], [12], Type.Double)
+        G = GrowingArray(1, [10], Type.Double)
+
+    out = _sol(fn)
+    assert "Array<double[12]> A[10];" in out
+    assert "GrowingArray<double> G[10];" in out
+
+
+def test_growing_array_binop_infers_growing_c_type():
+    """C = A + B where A, B are GrowingArray: C is declared as GrowingArray too."""
+    def fn():
+        A = GrowingArray(1, [10], Type.Float)
+        B = GrowingArray(1, [10], Type.Float)
+        C = A + B
+
+    out = _sol(fn)
+    assert "GrowingArray<float> C[10] = A + B;" in out
+
+
+# ---------------------------------------------------------------------------
+# @pysol_struct type declarations
+# ---------------------------------------------------------------------------
+
+def test_struct_decl_matches_spec_example():
+    """The exact worked example: class T(a: Double, b: Float) → type T : struct { a : double, b : float };"""
+    @pysol_struct
+    class _T_Spec:
+        a: Type.Double
+        b: Type.Float
+
+    def fn():
+        G = GrowingArray(1, [10], _T_Spec)
+
+    out = _sol(fn)
+    assert "type _T_Spec : struct { a : double, b : float };" in out
+
+
+def test_struct_decl_as_growing_array_element_type():
+    @pysol_struct
+    class _Vec3Struct:
+        x: Type.Double
+        y: Type.Double
+        z: Type.Double
+
+    def fn():
+        nb: Type.Int = 10
+        mb: Type.Int = 10
+        lb: Type.Int = 10
+        A = GrowingArray(3, [nb, mb, lb], _Vec3Struct)
+
+    out = _sol(fn)
+    assert "type _Vec3Struct : struct { x : double, y : double, z : double };" in out
+    assert "GrowingArray<_Vec3Struct> A[nb][mb][lb];" in out
+
+
+def test_struct_decl_as_regular_array_element_type():
+    @pysol_struct
+    class _PairStruct:
+        a: Type.Int
+        b: Type.Int
+
+    def fn():
+        A = Array(1, 1, [10], [12], _PairStruct)
+
+    out = _sol(fn)
+    assert "type _PairStruct : struct { a : int, b : int };" in out
+    assert "Array<_PairStruct[12]> A[10];" in out
+
+
+def test_struct_decl_as_variable_annotation():
+    @pysol_struct
+    class _ScalarStruct:
+        v: Type.Double
+
+    def fn():
+        G = GrowingArray(1, [10], _ScalarStruct)
+        x: _ScalarStruct = G
+
+    out = _sol(fn)
+    assert "type _ScalarStruct : struct { v : double };" in out
+    assert "_ScalarStruct x = G;" in out
+
+
+def test_struct_decl_appears_before_imports():
+    @pysol_struct
+    class _OrderStruct:
+        v: Type.Int
+
+    def fn():
+        k = import_kernel("noop", [])
+        G = GrowingArray(1, [10], _OrderStruct)
+        k()
+
+    out = _sol(fn)
+    lines = [l for l in out.splitlines() if l.strip()]
+    struct_idx = next(i for i, l in enumerate(lines) if l.startswith("type "))
+    import_idx = next(i for i, l in enumerate(lines) if l.startswith("import "))
+    assert struct_idx < import_idx
+
+
+def test_struct_decl_emitted_once_when_used_twice():
+    """A struct referenced by two arrays only gets one type declaration."""
+    @pysol_struct
+    class _SharedStruct:
+        v: Type.Double
+
+    def fn():
+        A = GrowingArray(1, [10], _SharedStruct)
+        B = GrowingArray(1, [20], _SharedStruct)
+
+    out = _sol(fn)
+    assert out.count("type _SharedStruct : struct") == 1
+
+
+def test_struct_decl_not_emitted_when_unused():
+    """A registered struct that isn't referenced in the function produces no decl."""
+    @pysol_struct
+    class _UnusedStruct:
+        v: Type.Int
+
+    def fn():
+        x: Type.Int = 5
+
+    out = _sol(fn)
+    assert "_UnusedStruct" not in out

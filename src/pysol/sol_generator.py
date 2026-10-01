@@ -20,6 +20,7 @@ from pysol.decorator import (
     _ArrayInfo,
     _is_array_call,
     _pysol_apply_pattern,
+    _struct_registry,
     _target_name,
     _unparse,
 )
@@ -122,13 +123,17 @@ def _ast_to_kernel_arg(node: ast.Call) -> Optional[KernelArgument]:
         return None
     is_input = bool(args[1].value)
 
-    # type — Attribute like Type.Int  or  pysol.Type.Int
-    if not isinstance(args[2], ast.Attribute):
+    # type — Attribute like Type.Int / pysol.Type.Int, or a bare Name
+    # referencing a @pysol_struct-registered struct type.
+    if isinstance(args[2], ast.Name) and args[2].id in _struct_registry:
+        arg_type: object = args[2].id
+    elif isinstance(args[2], ast.Attribute):
+        type_name = args[2].attr
+        if type_name not in _AST_TYPE_MAP:
+            return None
+        arg_type = _AST_TYPE_MAP[type_name]
+    else:
         return None
-    type_name = args[2].attr
-    if type_name not in _AST_TYPE_MAP:
-        return None
-    arg_type = _AST_TYPE_MAP[type_name]
 
     # n_dims — optional 4th positional arg or keyword
     n_dims = 0
@@ -153,10 +158,13 @@ def _annotation_to_sol_type(annotation: ast.AST) -> Optional[str]:
     Handles all of:
       Type.Int / pysol.Type.Int / pysol.Int  →  "int"
       Type.Float / pysol.Float               →  "float"
+      SomeStruct (a @pysol_struct class)     →  "SomeStruct"
       etc.
 
     Returns None for unrecognised annotations.
     """
+    if isinstance(annotation, ast.Name) and annotation.id in _struct_registry:
+        return annotation.id
     if not isinstance(annotation, ast.Attribute):
         return None
     attr = annotation.attr
@@ -221,6 +229,18 @@ def _collect_kernel_imports(
     return result
 
 
+# ── Struct type declaration ───────────────────────────────────────────────────
+
+def _render_struct_decl(name: str) -> str:
+    """
+    'type <Name> : struct { <f1> : <t1>, <f2> : <t2> };' for a @pysol_struct
+    class registered under *name*.
+    """
+    fields = _struct_registry[name]
+    field_strs = [f"{fname} : {_TYPE_TO_SOL[ftype]}" for fname, ftype in fields]
+    return f"type {name} : struct {{ {', '.join(field_strs)} }};"
+
+
 # ── Import argument declaration ───────────────────────────────────────────────
 
 def _gen_import_arg_decl(arg: KernelArgument) -> List[str]:
@@ -234,9 +254,15 @@ def _gen_import_arg_decl(arg: KernelArgument) -> List[str]:
     Array element  (n_dims=N):
         KernelArgument("a", False, Type.Float, n_dims=2)
             → ["in a_n1", "in a_n2", "out Array<float>a[a_n1][a_n2]"]
+
+    A @pysol_struct class may be used in place of a Type.X enum member; its
+    name (a plain string) is used verbatim as the .sol type keyword.
     """
     direction = "in" if arg.is_input else "out"
-    sol_type = _TYPE_TO_SOL.get(arg.type, arg.type.value.lower())
+    if isinstance(arg.type, str):
+        sol_type = arg.type
+    else:
+        sol_type = _TYPE_TO_SOL.get(arg.type, arg.type.value.lower())
 
     if not arg.is_array_element:
         return [f"{direction} {sol_type} {arg.name}"]
@@ -274,6 +300,20 @@ class _SolWriter:
         self._pending_hoists: List[Tuple[List[str], List[str]]] = []
         self._hoist_imports: List[str] = []
         self._seen_imports: Set[str] = set()
+        # @pysol_struct types referenced by name, in first-seen order.
+        self._used_structs: List[str] = []
+        self._seen_structs: Set[str] = set()
+        for info in arrays.values():
+            self._mark_struct_used(info.elem_type)
+        for kargs in self._kernel_arg_lists.values():
+            for karg in kargs:
+                if isinstance(karg.type, str):
+                    self._mark_struct_used(karg.type)
+
+    def _mark_struct_used(self, name: str) -> None:
+        if name in _struct_registry and name not in self._seen_structs:
+            self._seen_structs.add(name)
+            self._used_structs.append(name)
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -304,7 +344,13 @@ class _SolWriter:
             for j, decl in enumerate(hoisted_decls):
                 body_lines.insert(insert_at + j, "    " + decl)
 
-        # 1. import declarations (kernel imports + $$import-derived)
+        # 1. struct type declarations, for every @pysol_struct referenced by name
+        for struct_name in self._used_structs:
+            lines.append(_render_struct_decl(struct_name))
+        if self._used_structs:
+            lines.append("")
+
+        # 2. import declarations (kernel imports + $$import-derived)
         for var_name, kernel_name in self._kernels.items():
             kargs = self._kernel_arg_lists.get(var_name, [])
             decls: List[str] = []
@@ -316,7 +362,7 @@ class _SolWriter:
         if self._kernels or self._hoist_imports:
             lines.append("")
 
-        # 2. function declaration + body
+        # 3. function declaration + body
         lines.append(f"export sub {self._name}()")
         lines.append("{")
         lines.extend(body_lines)
@@ -372,6 +418,7 @@ class _SolWriter:
                     f"Variable '{var}' has unsupported type annotation '{ann_str}'; "
                     f"supported types are: {_SUPPORTED_VAR_TYPES}"
                 )
+            self._mark_struct_used(sol_type)
             self._declared_vars.add(var)
             return [f"{ind}{sol_type} {var} = {self._expr(node.value)};"]
 
@@ -692,8 +739,10 @@ class _SolWriter:
     def _array_decl_prefix(self, info: _ArrayInfo) -> str:
         """Type + varname + dims, no trailing semicolon — used for plain decls and decl+assign."""
         c_type = _SOL_TYPE.get(info.elem_type, info.elem_type)
-        block_dims = "".join(f"[{s}]" for s in _parse_size_list(info.block_size))
         array_dims = "".join(f"[{s}]" for s in _parse_size_list(info.array_size))
+        if info.is_growing:
+            return f"GrowingArray<{c_type}> {info.var}{array_dims}"
+        block_dims = "".join(f"[{s}]" for s in _parse_size_list(info.block_size))
         return f"Array<{c_type}{block_dims}> {info.var}{array_dims}"
 
     def _array_decl(self, info: _ArrayInfo) -> str:
@@ -739,6 +788,7 @@ class _SolWriter:
             array_size=ref_info.array_size,
             block_size=ref_info.block_size,
             elem_type=ref_info.elem_type,
+            is_growing=ref_info.is_growing,
         )
         self._arrays[var] = c_info
         return [f"{ind}{self._array_decl_prefix(c_info)} = {expr};"]
