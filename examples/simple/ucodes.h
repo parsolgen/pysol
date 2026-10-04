@@ -256,6 +256,108 @@ void check_ghost_test3d(int ii, int jj, int kk, int nb, int mb, int lb, int n, i
 	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
 }
 
+// Adds a fixed increment (1.0) to every interior cell of a block, leaving
+// the ghost layer untouched - it is about to be refreshed by the next
+// pysol_update_array call anyway. Used by update_array_3d_loop_test.py to
+// modify the array between each of many repeated exchange iterations.
+void modify_ghost_test3d(int ii, int jj, int kk,
+	int n, int m, int l, const double* a_in, int on, int om, int ol,  double* a)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			for (int k = 0; k < l; ++k)
+			{
+				const auto idx = k * n * m + i * m + j;
+				const bool interior = (i > 0 && i < n - 1 && j > 0 && j < m - 1 && k > 0 && k < l - 1);
+				if (interior) a[idx] += 1.0;
+			}
+		}
+	}
+	std::cout << "\n";
+}
+
+// Same check as check_ghost_test3d, but every block id is offset by a
+// uniform constant - e.g. the total of many modify_ghost_test3d increments
+// applied before this check runs, so the exchanged values are expected to
+// be "id + offset" rather than plain "id". Writes to
+// check3d_loop_<ii>_<jj>_<kk> (a distinct prefix from check_ghost_test3d's
+// output) so the two tests' result files never collide.
+void check_ghost_test3d_offset(int ii, int jj, int kk, int nb, int mb, int lb, double offset,
+                                int n, int m, int l, const double* a)
+{
+	const auto block_id = [offset](int bi, int bj, int bk) {
+		return static_cast<double>(bi) * 1000000.0 + static_cast<double>(bj) * 1000.0 + static_cast<double>(bk) + offset;
+	};
+	const auto neighbor_id = [&](int di, int dj, int dk) {
+		int ni = ii + di;
+		int nj = jj + dj;
+		int nk = kk + dk;
+		if (ni < 0 || ni >= nb) ni = ii;
+		if (nj < 0 || nj >= mb) nj = jj;
+		if (nk < 0 || nk >= lb) nk = kk;
+		return block_id(ni, nj, nk);
+	};
+	const double own_id = block_id(ii, jj, kk);
+
+	int mismatches = 0;
+	int unset = 0;
+
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			for (int k = 0; k < l; ++k)
+			{
+				const auto idx = k * n * m + i * m + j;
+				const bool ghost_i = i == 0 || i == n - 1;
+				const bool ghost_j = j == 0 || j == m - 1;
+				const bool ghost_k = k == 0 || k == l - 1;
+
+				if (!ghost_i && !ghost_j && !ghost_k)
+				{
+					if (a[idx] != own_id) ++mismatches;
+					continue;
+				}
+				if (ghost_i && ghost_k) {
+					continue;
+				}
+				if (ghost_j && ghost_k) {
+					continue;
+				}
+				if (ghost_i && ghost_j) {
+					continue;
+				}
+				if (a[idx] < 0.0)
+				{
+					++unset;
+					continue;
+				}
+
+				double candidates[4];
+				int ncand = 0;
+				candidates[ncand++] = own_id;
+				if (ghost_i) candidates[ncand++] = neighbor_id(i == 0 ? -1 : 1, 0, 0);
+				if (ghost_j) candidates[ncand++] = neighbor_id(0, j == 0 ? -1 : 1, 0);
+				if (ghost_k) candidates[ncand++] = neighbor_id(0, 0, k == 0 ? -1 : 1);
+
+				bool ok = false;
+				for (int c = 0; c < ncand; ++c)
+				{
+					if (a[idx] == candidates[c]) { ok = true; break; }
+				}
+				if (!ok) ++mismatches;
+			}
+		}
+	}
+
+	std::ofstream of{"check3d_loop_" + std::to_string(ii) + "_" + std::to_string(jj) + "_" + std::to_string(kk)};
+	of << mismatches << " " << unset << "\n";
+	std::cout << "CHECK3D_LOOP[" << ii << "," << jj << "," << kk << "] mismatches=" << mismatches
+	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
+}
+
 void printv(double v)
 {
 	std::cout << "V = " << v << "\n";

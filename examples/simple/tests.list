@@ -1,3 +1,4 @@
 update_array_3d_test.py
+update_array_3d_loop_test.py
 growing_array_struct_test.py
 reduction.py
