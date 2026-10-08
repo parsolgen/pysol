@@ -256,13 +256,21 @@ void check_ghost_test3d(int ii, int jj, int kk, int nb, int mb, int lb, int n, i
 	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
 }
 
-// Adds a fixed increment (1.0) to every interior cell of a block, leaving
-// the ghost layer untouched - it is about to be refreshed by the next
-// pysol_update_array call anyway. Used by update_array_3d_loop_test.py to
-// modify the array between each of many repeated exchange iterations.
+// Adds a fixed increment (1.0) to every interior cell of a block. The
+// ghost layer is copied forward from a_in unchanged (it is about to be
+// refreshed by the next pysol_update_array call anyway) rather than left
+// as whatever "a" happened to already hold: A's backing storage is a
+// multi-slot ring buffer (nversions>1, confirmed in the generated .cpp for
+// update_array_3d_loop_test.py), so a_in and a are genuinely distinct
+// physical buffers, not the same memory under two version labels - "a"
+// starts out as unrelated leftover data from several versions ago, not a
+// copy of a_in, until this kernel copies it explicitly. Used by
+// update_array_3d_loop_test.py to modify the array between each of many
+// repeated exchange iterations.
 void modify_ghost_test3d(int ii, int jj, int kk,
 	int n, int m, int l, const double* a_in, int on, int om, int ol,  double* a)
 {
+	(void)ii; (void)jj; (void)kk; (void)on; (void)om; (void)ol;
 	for (int i = 0; i < n; ++i)
 	{
 		for (int j = 0; j < m; ++j)
@@ -270,12 +278,12 @@ void modify_ghost_test3d(int ii, int jj, int kk,
 			for (int k = 0; k < l; ++k)
 			{
 				const auto idx = k * n * m + i * m + j;
+				a[idx] = a_in[idx];
 				const bool interior = (i > 0 && i < n - 1 && j > 0 && j < m - 1 && k > 0 && k < l - 1);
 				if (interior) a[idx] += 1.0;
 			}
 		}
 	}
-	std::cout << "\n";
 }
 
 // Same check as check_ghost_test3d, but every block id is offset by a
@@ -355,6 +363,193 @@ void check_ghost_test3d_offset(int ii, int jj, int kk, int nb, int mb, int lb, d
 	std::ofstream of{"check3d_loop_" + std::to_string(ii) + "_" + std::to_string(jj) + "_" + std::to_string(kk)};
 	of << mismatches << " " << unset << "\n";
 	std::cout << "CHECK3D_LOOP[" << ii << "," << jj << "," << kk << "] mismatches=" << mismatches
+	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
+}
+
+void print_el2d(int ii, int jj, int n, int m, const double* a)
+{
+	std::cout << "II: " << ii << ", JJ: " << jj << "\n";
+	for (int i = 0; i < n * m; ++i)
+	{
+		std::cout << std::format("{}", a[i]) << ' ';
+	}
+	std::cout << "\n";
+}
+
+// 2D analogue of init_ghost_test3d: fills the interior of a 2D block with a
+// value that uniquely identifies the owning block (ii, jj), and marks every
+// ghost cell (the one-cell-thick layer on all four edges) with a sentinel so
+// pysol_update_array's halo exchange can be verified by check_ghost_test2d*
+// below.
+void init_ghost_test2d(int ii, int jj, int n, int m, double* a)
+{
+	const double id = static_cast<double>(ii) * 1000.0 + static_cast<double>(jj);
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			const auto idx = i * m + j;
+			const bool interior = (i > 0 && i < n - 1 && j > 0 && j < m - 1);
+			a[idx] = (interior ? id : -1.0);
+		}
+	}
+}
+
+// 2D analogue of check_ghost_test3d. Every interior cell of a block holds a
+// single constant equal to the owning block's id, so the ghost layer
+// written by the halo exchange must, for any edge-aligned ghost cell, equal
+// the id of the block on that side (or the block's own id at a domain
+// boundary, where the exchange falls back to the block itself). Corner
+// ghost cells are a combination of two neighbouring blocks' halos and a
+// diagonal neighbor never populated by a face-wise exchange, so they are
+// skipped entirely rather than checked. Writes "<mismatches> <unset>" to
+// check2d_<ii>_<jj> so the driving Python script can assert a clean pass
+// across every block.
+void check_ghost_test2d(int ii, int jj, int nb, int mb, int n, int m, const double* a)
+{
+	const auto block_id = [](int bi, int bj) {
+		return static_cast<double>(bi) * 1000.0 + static_cast<double>(bj);
+	};
+	const auto neighbor_id = [&](int di, int dj) {
+		int ni = ii + di;
+		int nj = jj + dj;
+		if (ni < 0 || ni >= nb) ni = ii;
+		if (nj < 0 || nj >= mb) nj = jj;
+		return block_id(ni, nj);
+	};
+	const double own_id = block_id(ii, jj);
+
+	int mismatches = 0;
+	int unset = 0;
+
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			const auto idx = i * m + j;
+			const bool ghost_i = i == 0 || i == n - 1;
+			const bool ghost_j = j == 0 || j == m - 1;
+
+			if (!ghost_i && !ghost_j)
+			{
+				if (a[idx] != own_id) ++mismatches;
+				continue;
+			}
+			if (ghost_i && ghost_j) {
+				continue;
+			}
+			if (a[idx] < 0.0)
+			{
+				++unset;
+				continue;
+			}
+
+			double candidates[2];
+			int ncand = 0;
+			candidates[ncand++] = own_id;
+			if (ghost_i) candidates[ncand++] = neighbor_id(i == 0 ? -1 : 1, 0);
+			if (ghost_j) candidates[ncand++] = neighbor_id(0, j == 0 ? -1 : 1);
+
+			bool ok = false;
+			for (int c = 0; c < ncand; ++c)
+			{
+				if (a[idx] == candidates[c]) { ok = true; break; }
+			}
+			if (!ok) ++mismatches;
+		}
+	}
+
+	std::ofstream of{"check2d_" + std::to_string(ii) + "_" + std::to_string(jj)};
+	of << mismatches << " " << unset << "\n";
+	std::cout << "CHECK2D[" << ii << "," << jj << "] mismatches=" << mismatches
+	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
+}
+
+// 2D analogue of modify_ghost_test3d: adds a fixed increment (1.0) to every
+// interior cell of a block, leaving the ghost layer untouched - it is about
+// to be refreshed by the next pysol_update_array call anyway. Used by
+// update_array_2d_loop_test.py to modify the array between each of many
+// repeated exchange iterations.
+void modify_ghost_test2d(int ii, int jj,
+	int n, int m, const double* a_in, int on, int om, double* a)
+{
+	(void)ii; (void)jj; (void)on; (void)om;
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			const auto idx = i * m + j;
+			a[idx] = a_in[idx];
+			const bool interior = (i > 0 && i < n - 1 && j > 0 && j < m - 1);
+			if (interior) a[idx] += 1.0;
+		}
+	}
+}
+
+// Same check as check_ghost_test2d, but every block id is offset by a
+// uniform constant - e.g. the total of many modify_ghost_test2d increments
+// applied before this check runs, so the exchanged values are expected to
+// be "id + offset" rather than plain "id". Writes to
+// check2d_loop_<ii>_<jj> (a distinct prefix from check_ghost_test2d's
+// output) so the two tests' result files never collide.
+void check_ghost_test2d_offset(int ii, int jj, int nb, int mb, double offset,
+                                int n, int m, const double* a)
+{
+	const auto block_id = [offset](int bi, int bj) {
+		return static_cast<double>(bi) * 1000.0 + static_cast<double>(bj) + offset;
+	};
+	const auto neighbor_id = [&](int di, int dj) {
+		int ni = ii + di;
+		int nj = jj + dj;
+		if (ni < 0 || ni >= nb) ni = ii;
+		if (nj < 0 || nj >= mb) nj = jj;
+		return block_id(ni, nj);
+	};
+	const double own_id = block_id(ii, jj);
+
+	int mismatches = 0;
+	int unset = 0;
+
+	for (int i = 0; i < n; ++i)
+	{
+		for (int j = 0; j < m; ++j)
+		{
+			const auto idx = i * m + j;
+			const bool ghost_i = i == 0 || i == n - 1;
+			const bool ghost_j = j == 0 || j == m - 1;
+
+			if (!ghost_i && !ghost_j)
+			{
+				if (a[idx] != own_id) ++mismatches;
+				continue;
+			}
+			if (ghost_i && ghost_j) {
+				continue;
+			}
+			if (a[idx] < 0.0)
+			{
+				++unset;
+				continue;
+			}
+
+			double candidates[2];
+			int ncand = 0;
+			candidates[ncand++] = own_id;
+			if (ghost_i) candidates[ncand++] = neighbor_id(i == 0 ? -1 : 1, 0);
+			if (ghost_j) candidates[ncand++] = neighbor_id(0, j == 0 ? -1 : 1);
+
+			bool ok = false;
+			for (int c = 0; c < ncand; ++c)
+			{
+				if (a[idx] == candidates[c]) { ok = true; break; }
+			}
+			if (!ok) ++mismatches;
+		}
+	}
+
+	std::ofstream of{"check2d_loop_" + std::to_string(ii) + "_" + std::to_string(jj)};
+	of << mismatches << " " << unset << "\n";
+	std::cout << "CHECK2D_LOOP[" << ii << "," << jj << "] mismatches=" << mismatches
 	          << " unset=" << unset << (mismatches == 0 && unset == 0 ? " PASS" : " FAIL") << "\n";
 }
 

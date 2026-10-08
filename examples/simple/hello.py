@@ -85,7 +85,7 @@ def solver():
         it = it + 2
     for i in range(nb):
         for j in range(mb):
-            print_el_k(i, j, A[it - 2, i][j])
+            print_el_k(i, j, A[it, i][j])
 
 def print_command_line_arguments():
     for arg in sys.argv[1:]:

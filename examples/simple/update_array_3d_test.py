@@ -55,7 +55,7 @@ def update_array_3d_test():
             for k in range(lb):
                 init_k(i, j, k, A[i][j][k])
 
-    pysol_update_array(A, 0, A, 1)  
+    pysol_update_array(A, 0, A, 1)
 
     for i in range(nb):
         for j in range(mb):
