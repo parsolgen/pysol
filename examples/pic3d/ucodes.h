@@ -534,6 +534,7 @@ void write_vti(int ts, double x0x, double x0y, double x0z,
 	(void)gn4; (void)gm4; (void)gl4; (void)gn5; (void)gm5; (void)gl5;
 	(void)gn6; (void)gm6; (void)gl6; (void)gn7; (void)gm7; (void)gl7;
 	(void)gn8; (void)gm8; (void)gl8;
+
 	const int gn = gn1, gm = gm1, gl = gl1;
 
 	if (ts % 100 != 0) {
@@ -577,8 +578,8 @@ void write_vti(int ts, double x0x, double x0y, double x0z,
 	write_scalar("NodeVol", node_vol);
 	write_scalar("phi", phi);
 	write_scalar("rho", rho);
-	write_scalar("nd.ion", den_ion);
-	write_scalar("nd.elec", den_elec);
+	write_scalar("nd.O+", den_ion);
+	write_scalar("nd.e-", den_elec);
 
 	// electric field, 3 component vector
 	out << "<DataArray Name=\"ef\" NumberOfComponents=\"3\" format=\"ascii\" type=\"Float64\">\n";

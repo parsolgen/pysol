@@ -23,9 +23,15 @@ from pysol import (
 # - The Poisson solver's convergence loop is a `while` (not a for+break,
 #   which pysol's for-loops don't support anyway).
 #
-# Grid/particle/timestep counts are far smaller than the original
-# (21^3 grid, 81^3+41^3 particles, 10000 steps) so this compiles and runs
-# in reasonable time; the physics and algorithm structure are unchanged.
+# Grid/particle/timestep counts match the original (21^3 grid, 81^3 ion +
+# 41^3 electron quiet-start particles, dt=2e-10, 10000 steps) - see the
+# "mesh / block parameters" section below. The one deliberate deviation is
+# solver_max_it: the original runs up to 10000 SOR sweeps per solve but
+# checks L2 convergence every 25 sweeps and breaks out early (typically
+# within a few hundred sweeps for this grid/omega); pysol's while loop has
+# no break, so solver_max_it is instead a fixed sweep count chosen to
+# reach the same L2<1e-4 convergence depth (see the comment at its
+# declaration).
 # =============================================================================
 
 
@@ -224,15 +230,21 @@ def pic3d():
                                   KernelArgument("ef_z", True, Type.Double, 3)])
 
     # ── mesh / block parameters ─────────────────────────────────────────────
-    nb : Type.Int = 2
-    mb : Type.Int = 2
-    lb : Type.Int = 2
-    bn : Type.Int = 3
-    bm : Type.Int = 3
-    bl : Type.Int = 3
-    gn : Type.Int = 6
-    gm : Type.Int = 6
-    gl : Type.Int = 6
+    # gn/gm/gl = 21 matches the original's World(21,21,21). The fragmented
+    # Poisson solve needs a block decomposition of that global grid (the
+    # original has none - it's a single flat array); nb*bn = gn (3*7=21)
+    # splits it into a 3x3x3 block grid of 7^3-interior blocks, which is
+    # the block layout the pysol examples elsewhere pick when a grid size
+    # must be exact instead of just "a multiple of nb".
+    nb : Type.Int = 3
+    mb : Type.Int = 3
+    lb : Type.Int = 3
+    bn : Type.Int = 7
+    bm : Type.Int = 7
+    bl : Type.Int = 7
+    gn : Type.Int = 21
+    gm : Type.Int = 21
+    gl : Type.Int = 21
 
     x0x : Type.Double = -0.1
     x0y : Type.Double = -0.1
@@ -252,12 +264,12 @@ def pic3d():
     num_ts : Type.Int = 10000
     num_den : Type.Double = 1e11
 
-    npx_ion : Type.Int = 4
-    npy_ion : Type.Int = 4
-    npz_ion : Type.Int = 4
-    npx_elec : Type.Int = 3
-    npy_elec : Type.Int = 3
-    npz_elec : Type.Int = 3
+    npx_ion : Type.Int = 81
+    npy_ion : Type.Int = 81
+    npz_ion : Type.Int = 81
+    npx_elec : Type.Int = 41
+    npy_elec : Type.Int = 41
+    npz_elec : Type.Int = 41
 
     # Written as chained divisions rather than a single scientific-notation
     # literal: the .sol lexer only accepts "[0-9]+e-[0-9]+" (integer
@@ -278,14 +290,33 @@ def pic3d():
     elec_mass : Type.Double = me
     elec_charge : Type.Double = 0.0 - qe
 
-    solver_max_it : Type.Int = 20  # SOR sweeps per Poisson solve (see the while loop below)
+    # Fixed sweep count, since pysol's while loop has no break/early-exit:
+    # the original caps at 10000 sweeps but checks L2<1e-4 every 25 sweeps
+    # and stops as soon as that holds, which for a 21^3 grid at omega=1.4
+    # is typically a few hundred sweeps, not anywhere near the 10000 cap.
+    solver_max_it : Type.Int = 400  # SOR sweeps per Poisson solve (see the while loop below)
     solver_tol2 : Type.Double = 1e-4
 
     idx2 : Type.Double = 1.0 / (dhx * dhx)
     idy2 : Type.Double = 1.0 / (dhy * dhy)
     idz2 : Type.Double = 1.0 / (dhz * dhz)
     diag : Type.Double = 2.0 * idx2 + 2.0 * idy2 + 2.0 * idz2
-    omega : Type.Double = 1.4
+    # The original uses 1.4 because its sweep is TRUE Gauss-Seidel: each
+    # node update is written in place immediately, so later nodes in the
+    # same sweep already see earlier ones' new values. sor_sweep_block is
+    # single-assignment (every node reads phi_old, none of them see each
+    # other's updates until the next sweep), which is algorithmically
+    # Jacobi over-relaxation instead - a stricter-stability scheme whose
+    # safe omega range shrinks as the grid gets finer. At this grid's
+    # resolution 1.4 diverges to inf within ~2 timesteps and then crashes
+    # on the resulting NaN particle positions (confirmed by instrumenting
+    # push_particles directly); 1.0 (plain Jacobi, unconditionally stable
+    # for this diagonally-dominant discrete Laplacian) does not, and still
+    # converges L2resid2 to ~1e-20 well inside solver_max_it sweeps - both
+    # schemes converge to the same fixed point when they converge at all,
+    # so this does not change the converged phi, only how safely it's
+    # reached.
+    omega : Type.Double = 1.0
 
     # ── arrays ───────────────────────────────────────────────────────────────
     # Fragmented (nb x mb x lb blocks, 1-node ghost layer): the Poisson solve.
