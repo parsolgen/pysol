@@ -9,30 +9,32 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <vector>
 #include <mpi.h>
 
 /*=========================================================================
  * pysol reimplementation of pic3d.cpp (3D electrostatic PIC solver).
  *
- * Mesh fields phi/rho/resid2 are "fragmented": represented as blocked
- * pysol Arrays with a 1-node ghost layer per side (see exchange_3d.sol /
- * pysol_update_array, used throughout examples/simple). The Gauss-Seidel
- * /SOR Poisson solve runs per-block and exchanges phi's ghost nodes
- * between sweeps.
- *
- * A particle may be anywhere in the domain, so the electric field and
- * number density it needs are kept as GLOBAL (single-block) pysol Arrays
- * spanning the whole mesh. Particles themselves live in a
- * GrowingArray<Particle> per species (one dynamically growing vector),
- * per the "use GrowingArray to store particles" requirement. Two small
- * "bridge" kernels (distribute_rho_block / compute_efield_block) copy
- * between the global and fragmented representations.
+ * EVERYTHING here is fragmented into an nb x mb x lb block grid - phi/rho/
+ * resid2/ef (1-node ghost layer per side, ghost-exchanged via
+ * pysol_update_array), node_vol/den_ion/den_elec (no ghost - see
+ * reduce_density_block), and particles (one GrowingArray cell per block,
+ * no ghost - particles that cross a block boundary during a push are
+ * migrated to the owning block's cell by the mailbox scheme described at
+ * push_particles/merge_particles_mail below). None of it needs a GLOBAL,
+ * non-fragmented array or a static C++ buffer anywhere, which is what
+ * makes this run correctly distributed across more than one MPI process:
+ * every array element has exactly one rank that owns and produces it, and
+ * every cross-block dependency goes through a real pysol Array/
+ * GrowingArray read, which the RTS fetches from whichever rank owns it
+ * automatically.
  *
  * Every kernel argument that is a pysol Array gets its own block-size
  * integers (n, m, l) inserted immediately before it by the .sol generator
  * (one triple per array argument, even when two arrays share the same
  * shape) - every signature below is written to match that calling
- * convention exactly.
+ * convention exactly. GrowingArray<Particle> arguments get no such
+ * prefix (n_dims=0 for them).
  *
  * All physics (XtoL, trilinear gather/scatter, wall reflection, SOR
  * update, electric field finite differences) mirrors
@@ -50,7 +52,8 @@ inline int flat3(int i, int j, int k, int m, int l)
  * Mesh setup
  *=========================================================================*/
 
-// Zero-fills a fragmented phi block (interior + ghost).
+// Zero-fills a fragmented block (interior + ghost, or no-ghost - just
+// however many elements n*m*l actually is).
 void zero_block3d(int n, int m, int l, double* a)
 {
 	for (int i = 0; i < n * m * l; ++i)
@@ -59,30 +62,38 @@ void zero_block3d(int n, int m, int l, double* a)
 	}
 }
 
-// Node volumes on the GLOBAL mesh: full cell volume on interior nodes,
-// halved per boundary face. Mirrors computeNodeVolumes().
-void compute_node_volumes(double dhx, double dhy, double dhz,
-                           int gn, int gm, int gl,
-                           double* node_vol)
+// Node volumes for block (ii,jj,kk): full cell volume on interior nodes,
+// halved per boundary face it's on - same formula as the original's
+// computeNodeVolumes(), evaluated at each node's GLOBAL position, so no
+// ghost/exchange is needed: unlike density, nothing here depends on a
+// neighboring block's data. No ghost layer either (node_vol_block is
+// [bn,bm,bl]) - see reduce_density_block for why it doesn't need one.
+void compute_node_volumes_block(int ii, int jj, int kk,
+                                 double dhx, double dhy, double dhz,
+                                 int gn, int gm, int gl,
+                                 int bn, int bm, int bl, double* node_vol_block)
 {
-	for (int i = 0; i < gn; ++i)
+	for (int li = 0; li < bn; ++li)
 	{
-		for (int j = 0; j < gm; ++j)
+		for (int lj = 0; lj < bm; ++lj)
 		{
-			for (int k = 0; k < gl; ++k)
+			for (int lk = 0; lk < bl; ++lk)
 			{
+				int gi = ii * bn + li;
+				int gj = jj * bm + lj;
+				int gk = kk * bl + lk;
 				double V = dhx * dhy * dhz;
-				if (i == 0 || i == gn - 1) V *= 0.5;
-				if (j == 0 || j == gm - 1) V *= 0.5;
-				if (k == 0 || k == gl - 1) V *= 0.5;
-				node_vol[flat3(i, j, k, gm, gl)] = V;
+				if (gi == 0 || gi == gn - 1) V *= 0.5;
+				if (gj == 0 || gj == gm - 1) V *= 0.5;
+				if (gk == 0 || gk == gl - 1) V *= 0.5;
+				node_vol_block[flat3(li, lj, lk, bm, bl)] = V;
 			}
 		}
 	}
 }
 
 /*=========================================================================
- * Particle loading / push (GrowingArray<Particle> kernels)
+ * Particle loading / push / inter-block migration
  *=========================================================================*/
 
 // Quiet start: loads a uniform npx*npy*npz macroparticle lattice over box
@@ -90,6 +101,15 @@ void compute_node_volumes(double dhx, double dhy, double dhz,
 // velocity (the electric field is exactly zero before the first Poisson
 // solve, so addParticle()'s half-step velocity rewind in the original is
 // a no-op here and is omitted). Mirrors loadParticlesBoxQS()+addParticle().
+//
+// Always called on block (0,0,0) only (see pic3d.py): every particle
+// starts out sitting in the wrong cell for its actual position, except
+// whichever happen to fall in block (0,0,0)'s own territory. That's fine
+// - the very first push's mailbox migration (see push_particles /
+// merge_particles_mail below) sorts every particle into its real owning
+// block before anything else reads particles_ion/particles_elec, so
+// load_particles_box_qs itself never needs to know about block
+// boundaries at all.
 template <typename ElementT>
 void load_particles_box_qs(double x1x, double x1y, double x1z,
                             double x2x, double x2y, double x2z,
@@ -131,50 +151,82 @@ void load_particles_box_qs(double x1x, double x1y, double x1z,
 	}
 }
 
-// Particle push: v += (q/m)E dt, x += v dt, specular reflection on the
-// domain walls. E is gathered (trilinear) from the GLOBAL ef_x/ef_y/ef_z
-// arrays, since a particle may be anywhere in the domain. Mirrors
-// pushParticles() + XtoL() + gatherEF() + gather().
+// Particle push for block (ii,jj,kk): v += (q/m)E dt, x += v dt, specular
+// reflection on the domain walls - same physics as the original's
+// pushParticles() + XtoL() + gatherEF() + gather(), but E is gathered
+// (trilinear) from THIS block's own ghost-exchanged ef_x/ef_y/ef_z
+// fragment instead of a global array, since every particle in cell_old is
+// guaranteed (by the previous timestep's merge_particles_mail) to be
+// owned by this block, i.e. within its local range - the trilinear
+// gather's "+1" neighbor access is always covered by this block's own
+// 1-node ghost layer.
 //
 // ParSolGen arrays (and GrowingArray cells) are single-assignment: a
-// kernel that modifies one must read the OLD version and write a fresh
-// NEW version, like calc_main() in examples/simple/ucodes.h (prev -> curr)
-// does for a plain Array. Here the NEW cell is rebuilt one particle at a
-// time from the OLD cell, each with its position/velocity advanced.
+// kernel that modifies one must take the OLD and NEW array elements
+// separately, like hello.py's calc_main(prev, curr). A particle's pushed
+// position may now belong to a DIFFERENT block, though, so there is no
+// single "new cell" to rebuild into the way a single-rank global particle
+// population could: each particle is routed into one of 7 output cells -
+// "mail_self" (stayed in this block) or one of the 6 face-direction
+// mailboxes (mail_xm/xp/ym/yp/zm/zp) - instead of being written directly
+// into a neighbor's cell, which would be a second, independent producer
+// of that neighbor's array element and violate single-assignment exactly
+// like the old global ef_x/ef_y/ef_z did. merge_particles_mail (below)
+// is each block's single, sole producer of its own next-version cell,
+// combining its own mail_self with whatever its 6 neighbors routed
+// towards it.
+//
+// This assumes a particle never crosses more than one block in a single
+// timestep (a real constraint on dt relative to block size, same as any
+// CFL-style stability bound - if it's violated the simulation is already
+// numerically suspect for other reasons). A particle whose push would
+// need a genuinely diagonal (2- or 3-axis) hop is routed by its first
+// nonzero axis instead of being dropped - a documented approximation, not
+// a particle loss or a crash.
 //
 // "Fresh" NEW version does not mean "empty": a GrowingArray's backing
-// store only has a finite number of physical slots (nversions), so
-// array[pv+1,...] can be a slot last used several iterations ago and
-// still holding that old call's particles - cell_new is explicitly
-// cleared before being rebuilt so leftover data from a previous reuse of
-// this slot is never appended to.
+// store only has a finite number of physical slots (nversions), so a
+// mailbox cell can be a slot last used several iterations ago and still
+// holding old data - every mailbox is explicitly cleared before being
+// rebuilt so leftover data from a previous reuse of that slot is never
+// appended to.
 template <typename ElementTIn, typename ElementTOut>
 void push_particles(double dt, double qm_dt,
                      double x0x, double x0y, double x0z,
                      double xmx, double xmy, double xmz,
                      double dhx, double dhy, double dhz,
-                     int gn1, int gm1, int gl1, const double* ef_x,
-                     int gn2, int gm2, int gl2, const double* ef_y,
-                     int gn3, int gm3, int gl3, const double* ef_z,
-                     const ElementTIn* cell_old, ElementTOut* cell_new)
+                     int ii, int jj, int kk, int nb, int mb, int lb,
+                     int efnx, int efmx, int eflx, const double* ef_x_block,
+                     int efny, int efmy, int efly, const double* ef_y_block,
+                     int efnz, int efmz, int eflz, const double* ef_z_block,
+                     const ElementTIn* cell_old,
+                     ElementTOut* mail_self, ElementTOut* mail_xm, ElementTOut* mail_xp,
+                     ElementTOut* mail_ym, ElementTOut* mail_yp,
+                     ElementTOut* mail_zm, ElementTOut* mail_zp)
 {
-	(void)gn1; (void)gn2; (void)gn3; (void)gl3;
-	const int gm = gm1, gl = gl1;
-	(void)gm2; (void)gl2; (void)gm3;
+	(void)efny; (void)efmy; (void)efly; (void)efnz; (void)efmz; (void)eflz;
+	const int pm = efmx, pl = eflx;
+	const int bn = efnx - 2, bm = efmx - 2, bl = eflx - 2;
 
-	using P = typename std::decay_t<decltype(cell_new->data_)>::value_type;
+	using P = typename std::decay_t<decltype(mail_self->data_)>::value_type;
 
-	cell_new->data_.clear();
+	mail_self->data_.clear();
+	mail_xm->data_.clear();
+	mail_xp->data_.clear();
+	mail_ym->data_.clear();
+	mail_yp->data_.clear();
+	mail_zm->data_.clear();
+	mail_zp->data_.clear();
 
-	auto gather = [&](const double* f, int i, int j, int k, double di, double dj, double dk) -> double {
-		return f[flat3(i,     j,     k,     gm, gl)] * (1 - di) * (1 - dj) * (1 - dk) +
-		       f[flat3(i + 1, j,     k,     gm, gl)] * (di)     * (1 - dj) * (1 - dk) +
-		       f[flat3(i + 1, j + 1, k,     gm, gl)] * (di)     * (dj)     * (1 - dk) +
-		       f[flat3(i,     j + 1, k,     gm, gl)] * (1 - di) * (dj)     * (1 - dk) +
-		       f[flat3(i,     j,     k + 1, gm, gl)] * (1 - di) * (1 - dj) * (dk) +
-		       f[flat3(i + 1, j,     k + 1, gm, gl)] * (di)     * (1 - dj) * (dk) +
-		       f[flat3(i + 1, j + 1, k + 1, gm, gl)] * (di)     * (dj)     * (dk) +
-		       f[flat3(i,     j + 1, k + 1, gm, gl)] * (1 - di) * (dj)     * (dk);
+	auto gather = [&](const double* f, int li, int lj, int lk, double di, double dj, double dk) -> double {
+		return f[flat3(li,     lj,     lk,     pm, pl)] * (1 - di) * (1 - dj) * (1 - dk) +
+		       f[flat3(li + 1, lj,     lk,     pm, pl)] * (di)     * (1 - dj) * (1 - dk) +
+		       f[flat3(li + 1, lj + 1, lk,     pm, pl)] * (di)     * (dj)     * (1 - dk) +
+		       f[flat3(li,     lj + 1, lk,     pm, pl)] * (1 - di) * (dj)     * (1 - dk) +
+		       f[flat3(li,     lj,     lk + 1, pm, pl)] * (1 - di) * (1 - dj) * (dk) +
+		       f[flat3(li + 1, lj,     lk + 1, pm, pl)] * (di)     * (1 - dj) * (dk) +
+		       f[flat3(li + 1, lj + 1, lk + 1, pm, pl)] * (di)     * (dj)     * (dk) +
+		       f[flat3(li,     lj + 1, lk + 1, pm, pl)] * (1 - di) * (dj)     * (dk);
 	};
 
 	for (const auto& old_p : cell_old->data_)
@@ -184,13 +236,26 @@ void push_particles(double dt, double qm_dt,
 		double lcx = (p.pos_x - x0x) / dhx;
 		double lcy = (p.pos_y - x0y) / dhy;
 		double lcz = (p.pos_z - x0z) / dhz;
-		int i = (int)lcx; double di = lcx - i;
-		int j = (int)lcy; double dj = lcy - j;
-		int k = (int)lcz; double dk = lcz - k;
+		int gi = (int)lcx; double di = lcx - gi;
+		int gj = (int)lcy; double dj = lcy - gj;
+		int gk = (int)lcz; double dk = lcz - gk;
 
-		double efx = gather(ef_x, i, j, k, di, dj, dk);
-		double efy = gather(ef_y, i, j, k, di, dj, dk);
-		double efz = gather(ef_z, i, j, k, di, dj, dk);
+		// Local (block+ghost) indices for the OLD position: the particle
+		// was placed in this block's cell by the previous merge, so its
+		// old position is guaranteed within this block's owned range
+		// (li in [1,bn]) - clamped defensively anyway so a violation of
+		// the single-block-hop assumption degrades to a slightly wrong
+		// gather rather than an out-of-bounds read.
+		int li = gi - ii * bn + 1;
+		int lj = gj - jj * bm + 1;
+		int lk = gk - kk * bl + 1;
+		if (li < 1) li = 1; else if (li > bn) li = bn;
+		if (lj < 1) lj = 1; else if (lj > bm) lj = bm;
+		if (lk < 1) lk = 1; else if (lk > bl) lk = bl;
+
+		double efx = gather(ef_x_block, li, lj, lk, di, dj, dk);
+		double efy = gather(ef_y_block, li, lj, lk, di, dj, dk);
+		double efz = gather(ef_z_block, li, lj, lk, di, dj, dk);
 
 		p.vel_x += efx * qm_dt;
 		p.vel_y += efy * qm_dt;
@@ -206,101 +271,150 @@ void push_particles(double dt, double qm_dt,
 		if (p.pos_z < x0z)       { p.pos_z = 2 * x0z - p.pos_z; p.vel_z *= -1.0; }
 		else if (p.pos_z >= xmz) { p.pos_z = 2 * xmz - p.pos_z; p.vel_z *= -1.0; }
 
-		cell_new->data_.emplace_back(p);
+		// Reflection guarantees the NEW position is within [x0, xm), so
+		// the destination block index is always within [0, nb) etc - no
+		// clamping needed here (unlike the defensive clamp above).
+		int ngi = (int)((p.pos_x - x0x) / dhx);
+		int ngj = (int)((p.pos_y - x0y) / dhy);
+		int ngk = (int)((p.pos_z - x0z) / dhz);
+		int dii = ngi / bn;
+		int djj = ngj / bm;
+		int dkk = ngk / bl;
+
+		int ddi = dii - ii, ddj = djj - jj, ddk = dkk - kk;
+		ElementTOut* dst = mail_self;
+		if (ddi < 0) dst = mail_xm;
+		else if (ddi > 0) dst = mail_xp;
+		else if (ddj < 0) dst = mail_ym;
+		else if (ddj > 0) dst = mail_yp;
+		else if (ddk < 0) dst = mail_zm;
+		else if (ddk > 0) dst = mail_zp;
+
+		dst->data_.emplace_back(p);
 	}
+	(void)nb; (void)mb; (void)lb;
 }
 
-// Number density: scatter macroparticle weights (trilinear) onto the
-// GLOBAL den array, then divide by node volume. Mirrors
-// computeNumberDensity() + scatter().
-template <typename ElementT>
-void compute_density(double x0x, double x0y, double x0z,
-                      double dhx, double dhy, double dhz,
-                      const ElementT* cell,
-                      int gn1, int gm1, int gl1, const double* node_vol,
-                      int gn2, int gm2, int gl2, double* den)
+// Block (ii,jj,kk)'s sole producer of its own next-version particle cell:
+// combines its own survivors (from_self, written by ITS OWN push call's
+// mail_self) with whatever its 6 face neighbors routed towards it (each
+// neighbor's push wrote into ONE of ITS OWN 6 mailboxes, which this block
+// reads as from_xm/xp/ym/yp/zm/zp) - see push_particles above for the
+// mailbox scheme and why a particle can't just be written directly into a
+// neighbor's cell. At a domain edge, where a face neighbor doesn't exist,
+// pic3d.py passes THIS block's own, guaranteed-empty mailbox for that
+// direction instead (no particle is ever routed off the edge of the
+// domain, since push_particles reflects positions before computing a
+// destination block) - so every one of the 7 inputs here is always a
+// valid read, no boundary special-casing needed in C++ at all.
+template <typename ElementTIn, typename ElementTOut>
+void merge_particles_mail(const ElementTIn* from_self,
+                           const ElementTIn* from_xm, const ElementTIn* from_xp,
+                           const ElementTIn* from_ym, const ElementTIn* from_yp,
+                           const ElementTIn* from_zm, const ElementTIn* from_zp,
+                           ElementTOut* cell_new)
 {
-	(void)gn1; (void)gn2;
-	const int gm = gm1, gl = gl1;
+	cell_new->data_.clear();
+	for (const auto& p : from_self->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_xm->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_xp->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_ym->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_yp->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_zm->data_) cell_new->data_.emplace_back(p);
+	for (const auto& p : from_zp->data_) cell_new->data_.emplace_back(p);
+}
 
-	for (int n = 0; n < gn2 * gm2 * gl2; ++n) den[n] = 0.0;
+/*=========================================================================
+ * Number density (fragmented scatter + additive ghost reduction)
+ *=========================================================================*/
+
+// Scatters block (ii,jj,kk)'s own particles' macroparticle weight
+// (trilinear) onto a RAW, UNNORMALIZED charge buffer with the same
+// 1-node-ghost shape as phi: a particle near this block's edge
+// contributes partly to a node actually owned by the neighboring block,
+// landing in this block's ghost layer exactly the way sor_sweep_block's
+// stencil reads phi's ghost. Mirrors computeNumberDensity()'s scatter
+// step, except NOT yet divided by node volume, and NOT yet reduced across
+// blocks - see reduce_density_block below for both of those, done once
+// per node rather than once per contributing block (same reason
+// compute_density's node_vol division in the original PIC3D port happened
+// once at the end, not per particle).
+template <typename ElementT>
+void compute_density_raw_block(double x0x, double x0y, double x0z,
+                                double dhx, double dhy, double dhz,
+                                int ii, int jj, int kk,
+                                const ElementT* cell,
+                                int dn, int dm, int dl, double* den_raw)
+{
+	for (int n = 0; n < dn * dm * dl; ++n) den_raw[n] = 0.0;
+
+	const int bn = dn - 2, bm = dm - 2, bl = dl - 2;
 
 	for (const auto& p : cell->data_)
 	{
 		double lcx = (p.pos_x - x0x) / dhx;
 		double lcy = (p.pos_y - x0y) / dhy;
 		double lcz = (p.pos_z - x0z) / dhz;
-		int i = (int)lcx; double di = lcx - i;
-		int j = (int)lcy; double dj = lcy - j;
-		int k = (int)lcz; double dk = lcz - k;
+		int gi = (int)lcx; double di = lcx - gi;
+		int gj = (int)lcy; double dj = lcy - gj;
+		int gk = (int)lcz; double dk = lcz - gk;
+
+		int li = gi - ii * bn + 1;
+		int lj = gj - jj * bm + 1;
+		int lk = gk - kk * bl + 1;
+		if (li < 1) li = 1; else if (li > bn) li = bn;
+		if (lj < 1) lj = 1; else if (lj > bm) lj = bm;
+		if (lk < 1) lk = 1; else if (lk > bl) lk = bl;
+
 		double v = p.mpw;
-
-		den[flat3(i,     j,     k,     gm, gl)] += v * (1 - di) * (1 - dj) * (1 - dk);
-		den[flat3(i + 1, j,     k,     gm, gl)] += v * (di)     * (1 - dj) * (1 - dk);
-		den[flat3(i + 1, j + 1, k,     gm, gl)] += v * (di)     * (dj)     * (1 - dk);
-		den[flat3(i,     j + 1, k,     gm, gl)] += v * (1 - di) * (dj)     * (1 - dk);
-		den[flat3(i,     j,     k + 1, gm, gl)] += v * (1 - di) * (1 - dj) * (dk);
-		den[flat3(i + 1, j,     k + 1, gm, gl)] += v * (di)     * (1 - dj) * (dk);
-		den[flat3(i + 1, j + 1, k + 1, gm, gl)] += v * (di)     * (dj)     * (dk);
-		den[flat3(i,     j + 1, k + 1, gm, gl)] += v * (1 - di) * (dj)     * (dk);
-	}
-
-	for (int n = 0; n < gn2 * gm2 * gl2; ++n)
-	{
-		if (node_vol[n] != 0.0) den[n] /= node_vol[n];
-		else den[n] = 0.0;
+		den_raw[flat3(li,     lj,     lk,     dm, dl)] += v * (1 - di) * (1 - dj) * (1 - dk);
+		den_raw[flat3(li + 1, lj,     lk,     dm, dl)] += v * (di)     * (1 - dj) * (1 - dk);
+		den_raw[flat3(li + 1, lj + 1, lk,     dm, dl)] += v * (di)     * (dj)     * (1 - dk);
+		den_raw[flat3(li,     lj + 1, lk,     dm, dl)] += v * (1 - di) * (dj)     * (1 - dk);
+		den_raw[flat3(li,     lj,     lk + 1, dm, dl)] += v * (1 - di) * (1 - dj) * (dk);
+		den_raw[flat3(li + 1, lj,     lk + 1, dm, dl)] += v * (di)     * (1 - dj) * (dk);
+		den_raw[flat3(li + 1, lj + 1, lk + 1, dm, dl)] += v * (di)     * (dj)     * (dk);
+		den_raw[flat3(li,     lj + 1, lk + 1, dm, dl)] += v * (1 - di) * (dj)     * (dk);
 	}
 }
 
-// Writes the current particle count of a species into `count`, an "out"
-// scalar kernel argument, for screen diagnostics.
-template <typename ElementT>
-void count_particles(const ElementT* cell, int& count)
+// Reduces block (ii,jj,kk)'s raw scatter (see compute_density_raw_block)
+// into the final, normalized density: its own interior plus, on each of
+// the 6 faces it owns, the matching ghost-layer spillover computed BY
+// each neighbor's own raw scatter (xm_raw/xp_raw/ym_raw/yp_raw/zm_raw/
+// zp_raw) - this is the additive counterpart of phi's copy-only
+// pysol_update_array ghost exchange: pysol_update_array (generated from
+// exchange_3d.sol's _write_ghost3d_*) overwrites a ghost cell with a
+// neighbor's value, which is correct for phi/ef (a node's potential/field
+// doesn't change depending on which block looks at it) but wrong for
+// density (a particle's scatter weight must be counted once, not
+// replace whatever the owning block already had there) - so this reduces
+// by hand instead of calling pysol_update_array.
+//
+// fxm/fxp/fym/fyp/fzm/fzp select, per direction, which local index of the
+// corresponding raw block to read: the neighbor's matching ghost face
+// (e.g. xm_raw's "+i" ghost, index bn+1) when a real neighbor exists, or
+// this block's OWN same-direction ghost (always zero - no particle can be
+// scattered beyond the domain edge) at a domain boundary, where
+// xm_raw/xp_raw/etc is simply this block's own raw buffer again, passed
+// by pic3d.py exactly like merge_particles_mail's boundary handling.
+void reduce_density_block(int fxm, int fxp, int fym, int fyp, int fzm, int fzp,
+                           int sn, int sm, int sl, const double* self_raw,
+                           int n_xm, int m_xm, int l_xm, const double* xm_raw,
+                           int n_xp, int m_xp, int l_xp, const double* xp_raw,
+                           int n_ym, int m_ym, int l_ym, const double* ym_raw,
+                           int n_yp, int m_yp, int l_yp, const double* yp_raw,
+                           int n_zm, int m_zm, int l_zm, const double* zm_raw,
+                           int n_zp, int m_zp, int l_zp, const double* zp_raw,
+                           int vn, int vm, int vl, const double* node_vol,
+                           int dn, int dm, int dl, double* den)
 {
-	count = (int)cell->data_.size();
-}
+	(void)n_xm; (void)m_xm; (void)l_xm; (void)n_xp; (void)m_xp; (void)l_xp;
+	(void)n_ym; (void)m_ym; (void)l_ym; (void)n_yp; (void)m_yp; (void)l_yp;
+	(void)n_zm; (void)m_zm; (void)l_zm; (void)n_zp; (void)m_zp; (void)l_zp;
+	(void)vn; (void)vm;
 
-// Sums every cell of a single-block GLOBAL array (den_ion/den_elec) directly,
-// as an "out" scalar kernel argument - sum()/max()/min() go through a
-// reduce() that walks the program's main fragmented block distributor, which
-// does not match a single-block global array's (1x1x1) grid, so den_ion/
-// den_elec are summed with a plain kernel instead, for screen diagnostics.
-void sum_block(int gn, int gm, int gl, const double* block, double& result)
-{
-	double total = 0.0;
-	for (int n = 0; n < gn * gm * gl; ++n) total += block[n];
-	result = total;
-}
-
-/*=========================================================================
- * Charge density / fragmentation bridge
- *=========================================================================*/
-
-// rho = q_ion*den_ion + q_elec*den_elec, on the GLOBAL mesh. Mirrors
-// computeChargeDensity().
-void compute_charge_density(double q_ion, double q_elec,
-                             int gn1, int gm1, int gl1, const double* den_ion,
-                             int gn2, int gm2, int gl2, const double* den_elec,
-                             int gn3, int gm3, int gl3, double* rho)
-{
-	(void)gn1; (void)gm1; (void)gl1; (void)gn2; (void)gm2; (void)gl2;
-	const int n = gn3 * gm3 * gl3;
-	for (int idx = 0; idx < n; ++idx)
-	{
-		rho[idx] = den_ion[idx] * q_ion + den_elec[idx] * q_elec;
-	}
-}
-
-// Copies the interior nodes owned by block (ii,jj,kk) out of the GLOBAL
-// rho into the block's own fragmented rho array. The block's ghost layer
-// is left untouched - the SOR stencil below never reads a neighbor's rho,
-// only its own node, so rho needs no ghost exchange.
-void distribute_rho_block(int ii, int jj, int kk, int nb, int mb, int lb,
-                           int gn, int gm, int gl, const double* rho_global,
-                           int bn2, int bm2, int bl2, double* rho_block)
-{
-	const int bn = bn2 - 2, bm = bm2 - 2, bl = bl2 - 2;
-	(void)nb; (void)mb; (void)lb; (void)gn;
+	const int bn = sn - 2, bm = sm - 2, bl = sl - 2;
 
 	for (int li = 1; li <= bn; ++li)
 	{
@@ -308,26 +422,130 @@ void distribute_rho_block(int ii, int jj, int kk, int nb, int mb, int lb,
 		{
 			for (int lk = 1; lk <= bl; ++lk)
 			{
-				int gi = ii * bn + (li - 1);
-				int gj = jj * bm + (lj - 1);
-				int gk = kk * bl + (lk - 1);
-				rho_block[flat3(li, lj, lk, bm2, bl2)] = rho_global[flat3(gi, gj, gk, gm, gl)];
+				int n = flat3(li, lj, lk, sm, sl);
+				double total = self_raw[n];
+				if (li == 1)  total += xm_raw[flat3(fxm, lj, lk, sm, sl)];
+				if (li == bn) total += xp_raw[flat3(fxp, lj, lk, sm, sl)];
+				if (lj == 1)  total += ym_raw[flat3(li, fym, lk, sm, sl)];
+				if (lj == bm) total += yp_raw[flat3(li, fyp, lk, sm, sl)];
+				if (lk == 1)  total += zm_raw[flat3(li, lj, fzm, sm, sl)];
+				if (lk == bl) total += zp_raw[flat3(li, lj, fzp, sm, sl)];
+
+				int vidx = flat3(li - 1, lj - 1, lk - 1, vm, vl);
+				int didx = flat3(li - 1, lj - 1, lk - 1, dm, dl);
+				den[didx] = (node_vol[vidx] != 0.0) ? (total / node_vol[vidx]) : 0.0;
 			}
 		}
 	}
 }
 
-// Copies the interior nodes owned by block (ii,jj,kk) out of the block's
-// own fragmented phi into the GLOBAL phi array - the inverse of
-// distribute_rho_block() above, used only to reassemble phi for VTK output
-// (see write_vti()), since the real fields.vti output is one GLOBAL,
-// ghost-free mesh.
-void gather_phi_block(int ii, int jj, int kk, int nb, int mb, int lb,
-                       int pn, int pm, int pl, const double* phi_block,
-                       int gn, int gm, int gl, double* phi_global)
+// Writes the current particle count of a species' block into `count`, an
+// "out" scalar kernel argument - ACCUMULATES rather than overwrites, so
+// pic3d.py can call it once per block and add up a whole-domain total the
+// same way it already summed den_ion/den_elec (see sum_block below).
+template <typename ElementT>
+void count_particles(const ElementT* cell, int& count)
 {
+	count += (int)cell->data_.size();
+}
+
+// Sums every cell of block (ii,jj,kk)'s den_ion/den_elec fragment into
+// `result`, an "out" scalar kernel argument - ACCUMULATES (+= , not =)
+// across repeated per-block calls, since den_ion/den_elec are now
+// fragmented (nb*mb*lb blocks) rather than one single-block global array,
+// so sum()'s whole-array reduce no longer applies the way it does for
+// resid2/phi (whose block grid matches the program's main distributor);
+// pic3d.py resets the accumulator to 0 before the per-block loop, exactly
+// like n_ion/n_elec above.
+void sum_block(int gn, int gm, int gl, const double* block, double& result)
+{
+	double total = 0.0;
+	for (int n = 0; n < gn * gm * gl; ++n) total += block[n];
+	result += total;
+}
+
+/*=========================================================================
+ * Charge density (per block, no bridging needed anymore)
+ *=========================================================================*/
+
+// rho = q_ion*den_ion + q_elec*den_elec, for block (ii,jj,kk)'s own
+// (already fully reduced) den_ion/den_elec fragments, written directly
+// into rho_frag's interior - single assignment, one block, one producer,
+// no GLOBAL rho array or distribute_rho_block bridge needed at all now
+// that density itself is fragmented. Mirrors computeChargeDensity().
+void compute_charge_density_block(double q_ion, double q_elec,
+                                   int dnI, int dmI, int dlI, const double* den_ion,
+                                   int dnE, int dmE, int dlE, const double* den_elec,
+                                   int rn, int rm, int rl, double* rho_block)
+{
+	(void)dnE; (void)dmE; (void)dlE;
+	const int bn = rn - 2, bm = rm - 2, bl = rl - 2;
+	for (int li = 0; li < bn; ++li)
+	{
+		for (int lj = 0; lj < bm; ++lj)
+		{
+			for (int lk = 0; lk < bl; ++lk)
+			{
+				int didx = flat3(li, lj, lk, dmI, dlI);
+				int ridx = flat3(li + 1, lj + 1, lk + 1, rm, rl);
+				rho_block[ridx] = den_ion[didx] * q_ion + den_elec[didx] * q_elec;
+			}
+		}
+	}
+}
+
+/*=========================================================================
+ * VTI output - per block, no gather of any kind (see write_vti_files() in
+ * pic3d.py for the Python-side post-processing that assembles the final
+ * .vti from these).
+ *=========================================================================*/
+
+// Writes block (ii,jj,kk)'s own fields - phi, ef (now real, ghost-
+// exchanged pysol Arrays, so no finite-difference recompute needed here
+// any more), rho, den_ion, den_elec, node_vol - to
+// "results/vti_block_<ts>_<ii>_<jj>_<kk>.bin": bn*bm*bl records of 8
+// doubles in li/lj/lk nested order, no header - node (gi,gj,gk)/record
+// index is recoverable from the filename plus bn/bm/bl alone, since
+// gi = ii*bn + (li-1) etc (see distribute_rho_block's old convention,
+// still used here). Every rank only ever owns and writes the blocks
+// assigned to it, so (given a shared output directory) every block's
+// file exists once the run finishes regardless of how many ranks it ran
+// across - no cross-rank gather needed in C++ at all. write_vti_files()
+// in pic3d.py (run after the simulation, as a plain Python post-
+// processing step) reads every block's file and assembles the final
+// .vti, exactly like examples/simple/update_array_3d_loop_test.py's
+// verify() reads per-block check files after the run instead of
+// gathering them inside the .sol-compiled program.
+void dump_vti_block(int ts, int ii, int jj, int kk,
+                     int pn, int pm, int pl, const double* phi_block,
+                     int enx, int emx, int elx, const double* ef_x_block,
+                     int eny, int emy, int ely, const double* ef_y_block,
+                     int enz, int emz, int elz, const double* ef_z_block,
+                     int rn, int rm, int rl, const double* rho_block,
+                     int dnI, int dmI, int dlI, const double* den_ion_block,
+                     int dnE, int dmE, int dlE, const double* den_elec_block,
+                     int vn, int vm, int vl, const double* node_vol_block)
+{
+	(void)enx; (void)emx; (void)elx; (void)eny; (void)emy; (void)ely;
+	(void)enz; (void)emz; (void)elz; (void)rn; (void)rm; (void)rl;
+	(void)dnE; (void)dmE; (void)dlE; (void)vn; (void)vm; (void)vl;
+
+	if (ts % 100 != 0) {
+		return;
+	}
+
 	const int bn = pn - 2, bm = pm - 2, bl = pl - 2;
-	(void)nb; (void)mb; (void)lb; (void)gn;
+
+	std::filesystem::create_directories("results");
+	std::ostringstream name;
+	name << "results/vti_block_" << std::setfill('0') << std::setw(5) << ts
+	     << "_" << ii << "_" << jj << "_" << kk << ".bin";
+	std::ofstream out(name.str(), std::ios::binary);
+	if (!out.is_open())
+	{
+		std::cerr << "Could not open " << name.str() << "\n";
+		return;
+	}
 
 	for (int li = 1; li <= bn; ++li)
 	{
@@ -335,10 +553,13 @@ void gather_phi_block(int ii, int jj, int kk, int nb, int mb, int lb,
 		{
 			for (int lk = 1; lk <= bl; ++lk)
 			{
-				int gi = ii * bn + (li - 1);
-				int gj = jj * bm + (lj - 1);
-				int gk = kk * bl + (lk - 1);
-				phi_global[flat3(gi, gj, gk, gm, gl)] = phi_block[flat3(li, lj, lk, pm, pl)];
+				int n_gh = flat3(li, lj, lk, pm, pl);
+				int n_pl = flat3(li - 1, lj - 1, lk - 1, dmI, dlI);
+				double rec[8] = {
+					phi_block[n_gh], ef_x_block[n_gh], ef_y_block[n_gh], ef_z_block[n_gh],
+					rho_block[n_gh], den_ion_block[n_pl], den_elec_block[n_pl], node_vol_block[n_pl]
+				};
+				out.write(reinterpret_cast<const char*>(rec), sizeof(rec));
 			}
 		}
 	}
@@ -433,25 +654,35 @@ void residual_block(int ii, int jj, int kk, int nb, int mb, int lb,
 }
 
 /*=========================================================================
- * Electric field (fragmented phi -> global ef)
+ * Electric field (fragmented phi -> fragmented ef, ghost-exchanged by
+ * pysol_update_array exactly like phi itself)
  *=========================================================================*/
 
 // E = -grad(phi): central differences using the (ghost-exchanged)
 // neighboring block where available, 2nd-order one-sided differences at
-// the true global domain edges. Writes directly into the GLOBAL
-// ef_x/ef_y/ef_z arrays at each node's global offset. Mirrors
-// computeElectricField().
+// the true global domain edges. Writes block (ii,jj,kk)'s own interior
+// into ef_x_new/ef_y_new/ef_z_new (single assignment - one block, one
+// producer) and zeroes their ghost layer, which pysol_update_array then
+// fills from the neighboring blocks' interiors, exactly the way phi's own
+// ghost gets filled after each SOR sweep. Mirrors computeElectricField().
 void compute_efield_block(int ii, int jj, int kk,
                            double dhx, double dhy, double dhz,
                            int pn, int pm, int pl, const double* phi_block,
-                           int gnx, int gmx, int glx, double* ef_x,
-                           int gny, int gmy, int gly, double* ef_y,
-                           int gnz, int gmz, int glz, double* ef_z)
+                           int gn, int gm, int gl,
+                           int enx, int emx, int elx, double* ef_x_new,
+                           int eny, int emy, int ely, double* ef_y_new,
+                           int enz, int emz, int elz, double* ef_z_new)
 {
-	(void)gny; (void)gmy; (void)gly; (void)gnz; (void)gmz; (void)glz;
+	(void)eny; (void)emy; (void)ely; (void)enz; (void)emz; (void)elz;
 	const int bn = pn - 2, bm = pm - 2, bl = pl - 2;
 	const int si = pm * pl, sj = pl, sk = 1;
-	const int gn = gnx, gm = gmx, gl = glx;
+
+	for (int n = 0; n < enx * emx * elx; ++n)
+	{
+		ef_x_new[n] = 0.0;
+		ef_y_new[n] = 0.0;
+		ef_z_new[n] = 0.0;
+	}
 
 	for (int li = 1; li <= bn; ++li)
 	{
@@ -463,7 +694,6 @@ void compute_efield_block(int ii, int jj, int kk,
 				int gi = ii * bn + (li - 1);
 				int gj = jj * bm + (lj - 1);
 				int gk = kk * bl + (lk - 1);
-				int gidx = flat3(gi, gj, gk, gm, gl);
 
 				double Ex, Ey, Ez;
 
@@ -488,9 +718,9 @@ void compute_efield_block(int ii, int jj, int kk,
 				else
 					Ez = -(phi_block[n + sk] - phi_block[n - sk]) / (2 * dhz);
 
-				ef_x[gidx] = Ex;
-				ef_y[gidx] = Ey;
-				ef_z[gidx] = Ez;
+				ef_x_new[n] = Ex;
+				ef_y_new[n] = Ey;
+				ef_z_new[n] = Ez;
 			}
 		}
 	}
@@ -509,97 +739,4 @@ void print_step(int ts, int n_ion, int n_elec,
 	          << " sum(den_elec)=" << sum_den_elec
 	          << " solver_it=" << it << " L2resid2=" << l2resid2
 	          << " max(phi)=" << max_phi << " min(phi)=" << min_phi << "\n";
-}
-
-// Writes the GLOBAL mesh fields to "results/fields_NNNNN.vti", mirroring
-// Output::fields() in examples/pic3d/Output.cpp exactly: same VTK
-// ImageData header (Origin/Spacing/WholeExtent), same PointData DataArray
-// tags (NodeVol, phi, rho, per-species number density, then the 3-component
-// ef vector), and the same ASCII node order - Field_::operator<< there
-// loops "for k { for j { for i } }" (so k is outermost, i fastest in the
-// text), which this replicates via flat3(i, j, k, gm, gl) on the row-major
-// (i slowest, k fastest in memory) global arrays.
-void write_vti(int ts, double x0x, double x0y, double x0z,
-                double dhx, double dhy, double dhz,
-                int gn1, int gm1, int gl1, const double* node_vol,
-                int gn2, int gm2, int gl2, const double* phi,
-                int gn3, int gm3, int gl3, const double* rho,
-                int gn4, int gm4, int gl4, const double* den_ion,
-                int gn5, int gm5, int gl5, const double* den_elec,
-                int gn6, int gm6, int gl6, const double* ef_x,
-                int gn7, int gm7, int gl7, const double* ef_y,
-                int gn8, int gm8, int gl8, const double* ef_z)
-{
-	(void)gn2; (void)gm2; (void)gl2; (void)gn3; (void)gm3; (void)gl3;
-	(void)gn4; (void)gm4; (void)gl4; (void)gn5; (void)gm5; (void)gl5;
-	(void)gn6; (void)gm6; (void)gl6; (void)gn7; (void)gm7; (void)gl7;
-	(void)gn8; (void)gm8; (void)gl8;
-
-	const int gn = gn1, gm = gm1, gl = gl1;
-
-	if (ts % 100 != 0) {
-		return;
-	}
-
-	std::filesystem::create_directories("results");
-
-	std::ostringstream name;
-	name << "results/fields_" << std::setfill('0') << std::setw(5) << ts << ".vti";
-
-	std::ofstream out(name.str());
-	if (!out.is_open())
-	{
-		std::cerr << "Could not open " << name.str() << "\n";
-		return;
-	}
-
-	// ImageData is vtk format for structured Cartesian meshes
-	out << "<VTKFile type=\"ImageData\">\n";
-	out << "<ImageData Origin=\"" << x0x << " " << x0y << " " << x0z << "\" ";
-	out << "Spacing=\"" << dhx << " " << dhy << " " << dhz << "\" ";
-	out << "WholeExtent=\"0 " << gn - 1 << " 0 " << gm - 1 << " 0 " << gl - 1 << "\">\n";
-
-	// output data stored on nodes (point data)
-	out << "<PointData>\n";
-
-	auto write_scalar = [&](const char* field_name, const double* f) {
-		out << "<DataArray Name=\"" << field_name
-		    << "\" NumberOfComponents=\"1\" format=\"ascii\" type=\"Float64\">\n";
-		for (int k = 0; k < gl; ++k)
-		{
-			for (int j = 0; j < gm; ++j)
-				for (int i = 0; i < gn; ++i)
-					out << f[flat3(i, j, k, gm, gl)] << " ";
-			out << "\n";
-		}
-		out << "</DataArray>\n";
-	};
-
-	write_scalar("NodeVol", node_vol);
-	write_scalar("phi", phi);
-	write_scalar("rho", rho);
-	write_scalar("nd.O+", den_ion);
-	write_scalar("nd.e-", den_elec);
-
-	// electric field, 3 component vector
-	out << "<DataArray Name=\"ef\" NumberOfComponents=\"3\" format=\"ascii\" type=\"Float64\">\n";
-	for (int k = 0; k < gl; ++k)
-	{
-		for (int j = 0; j < gm; ++j)
-		{
-			for (int i = 0; i < gn; ++i)
-			{
-				int n = flat3(i, j, k, gm, gl);
-				out << ef_x[n] << " " << ef_y[n] << " " << ef_z[n] << " ";
-			}
-		}
-		out << "\n";
-	}
-	out << "</DataArray>\n";
-
-	// close out tags
-	out << "</PointData>\n";
-	out << "</ImageData>\n";
-	out << "</VTKFile>\n";
-	out.close();
 }

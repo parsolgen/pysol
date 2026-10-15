@@ -325,7 +325,13 @@ class _SolWriter:
 
         # Insert each call's hoisted declarations after the last declaration of any
         # array it references.  Scan original body_lines for insertion positions,
-        # then insert in reverse call order so earlier indices remain stable.
+        # then insert in descending-position order (not call order: an array may
+        # be the target of more than one pysol_update_array call - e.g. ping-ponged
+        # once per timestep - so positions are not monotonic with call order, and
+        # inserting in call order can insert at a stale index already shifted by
+        # an earlier insertion that landed at or below it). Processing strictly by
+        # descending position guarantees every insertion lands at an index greater
+        # than all positions not yet processed, so their recorded positions stay valid.
         positions: List[int] = []
         for ref_vars, _ in self._pending_hoists:
             last_idx = -1
@@ -336,7 +342,8 @@ class _SolWriter:
                         break
             positions.append(last_idx)
 
-        for k in range(len(self._pending_hoists) - 1, -1, -1):
+        order = sorted(range(len(self._pending_hoists)), key=lambda k: positions[k], reverse=True)
+        for k in order:
             _, hoisted_decls = self._pending_hoists[k]
             if not hoisted_decls:
                 continue
