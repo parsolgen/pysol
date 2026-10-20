@@ -1,6 +1,6 @@
 import pytest
 from pysol import (
-    Array, NotSupportedIfStatement, NotSupportedLoop, Type, pysol,
+    Array, CSRMatrix, NotSupportedIfStatement, NotSupportedLoop, Type, pysol,
     pysol_struct, UnsupportedStructFieldType,
 )
 from pysol.decorator import _analyse, _struct_registry
@@ -44,6 +44,23 @@ def test_detects_bare_array():
     assert a.arrays[0].array_size == "[10]"
     assert a.arrays[0].block_size == "[10]"
     assert a.arrays[0].elem_type == "Type.Float"
+    assert a.arrays[0].is_single_version is False
+
+
+def test_detects_single_version_array_positional():
+    def fn():
+        a = Array(1, 1, [10], [10], Type.Float, True)
+
+    a = _run(fn)
+    assert a.arrays[0].is_single_version is True
+
+
+def test_detects_single_version_array_keyword():
+    def fn():
+        a = Array(1, 1, [10], [10], Type.Float, is_single_version=True)
+
+    a = _run(fn)
+    assert a.arrays[0].is_single_version is True
 
 
 def test_detects_qualified_array():
@@ -87,6 +104,64 @@ def test_no_arrays():
 
     a = _run(fn)
     assert a.arrays == []
+
+
+# ---------------------------------------------------------------------------
+# CSRMatrix detection
+# ---------------------------------------------------------------------------
+
+def test_detects_bare_csr_matrix():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    analysis = _run(fn)
+    assert len(analysis.csr_matrices) == 1
+    info = analysis.csr_matrices[0]
+    assert info.var == "A"
+    assert info.dim1 == "4"
+    assert info.dim2 == "4"
+    assert info.n_blocks_1 == "2"
+    assert info.n_blocks_2 == "2"
+    assert info.nnz == "6"
+    assert info.ia == "ia"
+    assert info.ja == "ja"
+    assert info.a == "a"
+    assert info.elem_type == "Type.Double"
+
+
+def test_detects_annotated_csr_matrix():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Float)
+        A: CSRMatrix = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Float)
+
+    analysis = _run(fn)
+    assert len(analysis.csr_matrices) == 1
+    assert analysis.csr_matrices[0].var == "A"
+    assert analysis.csr_matrices[0].elem_type == "Type.Float"
+
+
+def test_no_csr_matrices():
+    def fn():
+        x = 1 + 2
+
+    analysis = _run(fn)
+    assert analysis.csr_matrices == []
+
+
+def test_csr_matrix_bad_size_literal_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ValueError):
+        _run(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +352,89 @@ def test_if_expression_arg_raises():
 
     with pytest.raises(NotSupportedIfStatement):
         _run(fn)
+
+
+# ---------------------------------------------------------------------------
+# is_zero(...) if-conditions
+# ---------------------------------------------------------------------------
+
+def test_if_is_zero_var():
+    def fn():
+        if is_zero(b):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "is_zero(b)"
+
+
+def test_if_not_is_zero_var():
+    def fn():
+        if not is_zero(b):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "not is_zero(b)"
+
+
+def test_if_is_zero_csr_block_subscript():
+    def fn():
+        if is_zero(A[i][j]):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "is_zero(A[i][j])"
+
+
+def test_if_not_is_zero_csr_block_subscript():
+    def fn():
+        if not is_zero(A[i][j]):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "not is_zero(A[i][j])"
+
+
+def test_if_is_zero_too_many_args_raises():
+    def fn():
+        if is_zero(a, b):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_is_zero_literal_arg_raises():
+    def fn():
+        if is_zero(1):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_not_other_call_still_requires_variable_args():
+    """The 'not expr(...)' relaxation is general, but expr's own argument
+    rules (plain variables only, unless it's specifically is_zero) still
+    apply."""
+    def fn():
+        if not check(a + b):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_not_other_call_with_var_args_is_valid():
+    def fn():
+        if not check(a, b):
+            pass
+
+    result = _run(fn)
+    assert result.if_stmts[0].condition == "not check(a, b)"
 
 
 # --- binary comparison forms (now valid) ------------------------------------

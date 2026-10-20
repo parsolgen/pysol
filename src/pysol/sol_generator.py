@@ -18,14 +18,19 @@ from pysol.decorator import (
     UnsupportedVariableType,
     _Analysis,
     _ArrayInfo,
+    _CSRMatrixInfo,
     _is_array_call,
+    _is_csr_block_annotation,
+    _is_csr_matrix_call,
+    _is_reset_call,
+    _is_zero_call,
     _pysol_apply_pattern,
     _struct_registry,
     _target_name,
     _unparse,
 )
 from pysol.kernel import KernelArgument
-from pysol.types import Type
+from pysol.types import CSRBlockType, Type
 
 
 # ── Type maps ────────────────────────────────────────────────────────────────
@@ -83,6 +88,23 @@ _NON_COMM_OPS = {ast.Sub, ast.Div, ast.Mod, ast.FloorDiv}
 
 # ── AST helpers ───────────────────────────────────────────────────────────────
 
+def _csr_block_element_type(node: ast.AST) -> Optional[Type]:
+    """For a Type.CSRBlock(Type.XXX) call node, return Type.XXX; else None."""
+    if not _is_csr_block_annotation(node):
+        return None
+    call = node  # type: ast.Call
+    elem_node: Optional[ast.AST] = None
+    if call.args:
+        elem_node = call.args[0]
+    else:
+        for kw in call.keywords:
+            if kw.arg == "element_type":
+                elem_node = kw.value
+    if not isinstance(elem_node, ast.Attribute) or elem_node.attr not in _AST_TYPE_MAP:
+        return None
+    return _AST_TYPE_MAP[elem_node.attr]
+
+
 def _is_import_kernel_call(node: ast.AST) -> bool:
     if not isinstance(node, ast.Call):
         return False
@@ -123,10 +145,16 @@ def _ast_to_kernel_arg(node: ast.Call) -> Optional[KernelArgument]:
         return None
     is_input = bool(args[1].value)
 
-    # type — Attribute like Type.Int / pysol.Type.Int, or a bare Name
-    # referencing a @pysol_struct-registered struct type.
+    # type — Attribute like Type.Int / pysol.Type.Int, a bare Name
+    # referencing a @pysol_struct-registered struct type, or a
+    # Type.CSRBlock(Type.XXX) call.
     if isinstance(args[2], ast.Name) and args[2].id in _struct_registry:
         arg_type: object = args[2].id
+    elif _is_csr_block_annotation(args[2]):
+        elem = _csr_block_element_type(args[2])
+        if elem is None:
+            return None
+        arg_type = CSRBlockType(elem)
     elif isinstance(args[2], ast.Attribute):
         type_name = args[2].attr
         if type_name not in _AST_TYPE_MAP:
@@ -159,12 +187,18 @@ def _annotation_to_sol_type(annotation: ast.AST) -> Optional[str]:
       Type.Int / pysol.Type.Int / pysol.Int  →  "int"
       Type.Float / pysol.Float               →  "float"
       SomeStruct (a @pysol_struct class)     →  "SomeStruct"
+      Type.CSRBlock(Type.Double)             →  "CSRBlock<double>"
       etc.
 
     Returns None for unrecognised annotations.
     """
     if isinstance(annotation, ast.Name) and annotation.id in _struct_registry:
         return annotation.id
+    if _is_csr_block_annotation(annotation):
+        elem = _csr_block_element_type(annotation)
+        if elem is None:
+            return None
+        return f"CSRBlock<{_VAR_TYPE_TO_SOL[elem]}>"
     if not isinstance(annotation, ast.Attribute):
         return None
     attr = annotation.attr
@@ -257,10 +291,18 @@ def _gen_import_arg_decl(arg: KernelArgument) -> List[str]:
 
     A @pysol_struct class may be used in place of a Type.X enum member; its
     name (a plain string) is used verbatim as the .sol type keyword.
+
+    A Type.CSRBlock(Type.X) value (n_dims=0, like a scalar/struct — a CSR
+    block is never wrapped in Array<...>, unlike an n_dims>=1 ArrayElement):
+        KernelArgument("a", True, Type.CSRBlock(Type.Double))
+            → ["in CSRBlock<double> a"]
     """
     direction = "in" if arg.is_input else "out"
     if isinstance(arg.type, str):
         sol_type = arg.type
+    elif isinstance(arg.type, CSRBlockType):
+        sol_type = f"CSRBlock<{_TYPE_TO_SOL.get(arg.type.element_type, arg.type.element_type.value.lower())}>"
+        return [f"{direction} {sol_type} {arg.name}"]
     else:
         sol_type = _TYPE_TO_SOL.get(arg.type, arg.type.value.lower())
 
@@ -283,6 +325,7 @@ class _SolWriter:
         func_def: ast.FunctionDef,
         imported_kernels: Dict[str, Tuple[str, List[KernelArgument]]],
         arrays: Dict[str, _ArrayInfo],
+        csr_matrices: Optional[Dict[str, _CSRMatrixInfo]] = None,
     ) -> None:
         self._name = func_name
         self._func_def = func_def
@@ -294,6 +337,7 @@ class _SolWriter:
             var: kargs for var, (_, kargs) in imported_kernels.items()
         }
         self._arrays = arrays
+        self._csr_matrices: Dict[str, _CSRMatrixInfo] = csr_matrices or {}
         self._declared_vars: Set[str] = set()
         self._update_array_call_count: int = 0
         # Each entry: (referenced_array_vars, hoisted_decl_strings) per call.
@@ -394,12 +438,28 @@ class _SolWriter:
         if isinstance(node, ast.Assign):
             if _is_import_kernel_call(node.value):
                 return []
+            if isinstance(node.targets[0], ast.Subscript):
+                # x[v,] = <vector expr>; -> x{v} = <expr>; - a whole-vector
+                # (version-tagged, no block coordinate) assignment, e.g.
+                # bicg.sol's "x{1} = x + a_c * Pr;". Not a new declaration,
+                # so no _declared_vars bookkeeping - x already exists.
+                return [f"{ind}{self._expr(node.targets[0])} = {self._expr(node.value)};"]
             if _is_array_call(node.value):
                 var = _target_name(node.targets[0])
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
+            if _is_csr_matrix_call(node.value):
+                var = _target_name(node.targets[0])
+                csr_info = self._csr_matrices.get(var)
+                return [ind + self._csr_matrix_decl(csr_info)] if csr_info else []
             if self._is_array_binop(node.value):
                 return self._array_binop_stmt(node.targets[0], node.value, ind)
+            if isinstance(node.targets[0], ast.Name) and node.targets[0].id in self._arrays:
+                # A = B[v,];  ->  A = B{v};  (whole-vector copy, e.g. bicg.sol's
+                # "Rr = B;") - A itself stays bare, matching how a bare vector
+                # operand already renders elsewhere (@, +, -, *); not a new
+                # declaration, so no _declared_vars bookkeeping.
+                return [f"{ind}{node.targets[0].id} = {self._expr(node.value)};"]
             var = _target_name(node.targets[0])
             if var in self._declared_vars:
                 return [f"{ind}{var} = {self._expr(node.value)};"]
@@ -413,6 +473,10 @@ class _SolWriter:
                 var = _target_name(node.target)
                 info = self._arrays.get(var)
                 return [ind + self._array_decl(info)] if info else []
+            if _is_csr_matrix_call(node.value):
+                var = _target_name(node.target)
+                csr_info = self._csr_matrices.get(var)
+                return [ind + self._csr_matrix_decl(csr_info)] if csr_info else []
             if self._is_array_binop(node.value):
                 return self._array_binop_stmt(node.target, node.value, ind)
             var = _target_name(node.target)
@@ -447,6 +511,8 @@ class _SolWriter:
             call = node.value
             if _unparse(call.func) in ("pysol_update_array", "pysol.pysol_update_array"):
                 return self._update_array_stmt(call, ind)
+            if _is_reset_call(call):
+                return [ind + self._reset_stmt(call)]
             return [ind + self._call_stmt(call) + ";"]
 
         return []
@@ -490,6 +556,17 @@ class _SolWriter:
         return lines
 
     # ── call statements ───────────────────────────────────────────────────────
+
+    def _reset_stmt(self, call: ast.Call) -> str:
+        """reset(A) → 'A = {};' — A may be an Array, GrowingArray, or CSRMatrix."""
+        if len(call.args) != 1 or call.keywords:
+            raise UnsupportedCallError("reset() expects exactly 1 argument: reset(A)")
+        arg = call.args[0]
+        if not isinstance(arg, ast.Name):
+            raise UnsupportedCallError(
+                f"reset(): argument must be a plain variable, got '{_unparse(arg)}'"
+            )
+        return f"{arg.id} = {{}};"
 
     def _update_array_stmt(self, call: ast.Call, ind: str) -> List[str]:
         """Handle pysol_update_array(source, source_version, destination, destination_version)."""
@@ -655,7 +732,12 @@ class _SolWriter:
     # ── expression generation ─────────────────────────────────────────────────
 
     def _cond(self, node: ast.AST) -> str:
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return f"!{self._cond(node.operand)}"
         if isinstance(node, ast.Call):
+            if _is_zero_call(node):
+                args = [self._expr(a) for a in node.args]
+                return f"%zero({', '.join(args)})"
             args = [_unparse(a) for a in node.args]
             return f"{_unparse(node.func)}({', '.join(args)})"
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
@@ -668,6 +750,8 @@ class _SolWriter:
 
     def _expr(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):
+            if node.id == "LATEST_VERSION":
+                return "%latest"
             return node.id
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
@@ -675,6 +759,13 @@ class _SolWriter:
             if isinstance(node.value, str):
                 return f'"{node.value}"'
             return str(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            # a @ b -> (a, b): the .sol dot-product operator over two whole
+            # blocked-vector Arrays (every block summed in one reduction,
+            # not a single block) - see bicg.sol's "double beta = (Zr, Rl);".
+            # Each side is rendered the same way +/-/* render a version-only
+            # vector operand below (a[version,] -> a{version}).
+            return f"({self._expr(node.left)}, {self._expr(node.right)})"
         if isinstance(node, ast.BinOp):
             op = _BIN_OPS.get(type(node.op), "?")
             pp = _OP_PREC.get(type(node.op), 0)
@@ -708,6 +799,19 @@ class _SolWriter:
             sl = node.slice
             if _AST_INDEX is not None and isinstance(sl, _AST_INDEX):
                 sl = sl.value  # type: ignore[arg-type]
+            if isinstance(sl, ast.Tuple) and sl.elts:
+                is_latest = isinstance(sl.elts[0], ast.Name) and sl.elts[0].id == "LATEST_VERSION"
+                if is_latest or len(sl.elts) == 1:
+                    # A[LATEST_VERSION, i][j][k] → A{%latest}[i][j][k]
+                    # a[version,]            → a{version}  (a 1-tuple: just
+                    #   a version, no block coordinate - the whole blocked
+                    #   vector at that version, as used by @/+/-/* on
+                    #   "vectors", 1-D arrays of 1-D blocks)
+                    version_str = "%latest" if is_latest else self._expr(sl.elts[0])
+                    ref = f"{self._expr(node.value)}{{{version_str}}}"
+                    for e in sl.elts[1:]:
+                        ref += f"[{self._expr(e)}]"
+                    return ref
             idx = (
                 ", ".join(self._expr(e) for e in sl.elts)
                 if isinstance(sl, ast.Tuple)
@@ -750,10 +854,54 @@ class _SolWriter:
         if info.is_growing:
             return f"GrowingArray<{c_type}> {info.var}{array_dims}"
         block_dims = "".join(f"[{s}]" for s in _parse_size_list(info.block_size))
-        return f"Array<{c_type}{block_dims}> {info.var}{array_dims}"
+        array_kind = "SingleVersionArray" if info.is_single_version else "Array"
+        return f"{array_kind}<{c_type}{block_dims}> {info.var}{array_dims}"
 
     def _array_decl(self, info: _ArrayInfo) -> str:
         return self._array_decl_prefix(info) + ";"
+
+    # ── CSRMatrix declaration ─────────────────────────────────────────────────
+
+    def _check_csr_component_type(self, info: _CSRMatrixInfo, role: str, var: str, expected: str) -> None:
+        """
+        Validate that ia/ja (role='index', must be Type.Int) or a
+        (role='value', must match the matrix's own elem_type) is a known
+        1-D Array of the right element type. Arrays not declared in this
+        same function (e.g. passed in as a parameter) can't be checked
+        here and are passed through unchecked.
+        """
+        arr_info = self._arrays.get(var)
+        if arr_info is None:
+            return
+        if arr_info.n_dims != "1":
+            raise ArrayOperationError(
+                f"CSRMatrix '{info.var}': '{var}' ({role}) must be a 1-D Array "
+                f"(n_dims=1), got n_dims={arr_info.n_dims}"
+            )
+        if arr_info.elem_type != expected:
+            raise ArrayOperationError(
+                f"CSRMatrix '{info.var}': '{var}' ({role}) must have element type "
+                f"{expected}, got {arr_info.elem_type}"
+            )
+
+    def _csr_matrix_decl(self, info: _CSRMatrixInfo) -> str:
+        """
+        'BlockedCSRMatrix<type[][]> A = {dim1, dim2, nnz, n_blocks_1,
+        n_blocks_2, ia, ja, a};' — note the .sol argument order (dim1, dim2,
+        nnz, n_blocks_1, n_blocks_2, ...) differs from the Python
+        constructor's own order (size=[dim1,dim2], n_blocks=[...], nnz, ...).
+        """
+        self._check_csr_component_type(info, "index", info.ia, "Type.Int")
+        self._check_csr_component_type(info, "index", info.ja, "Type.Int")
+        self._check_csr_component_type(info, "value", info.a, info.elem_type)
+
+        c_type = _SOL_TYPE.get(info.elem_type, info.elem_type)
+        args = ", ".join([
+            info.dim1, info.dim2, info.nnz,
+            info.n_blocks_1, info.n_blocks_2,
+            info.ia, info.ja, info.a,
+        ])
+        return f"BlockedCSRMatrix<{c_type}[][]> {info.var} = {{{args}}};"
 
     # ── array binary-operation statement ─────────────────────────────────────
 
@@ -820,4 +968,5 @@ def generate_sol(func, analysis: _Analysis) -> str:
 
     imported_kernels = _collect_kernel_imports(func_def)
     arrays = {info.var: info for info in analysis.arrays}
-    return _SolWriter(func.__name__, func_def, imported_kernels, arrays).render()
+    csr_matrices = {info.var: info for info in analysis.csr_matrices}
+    return _SolWriter(func.__name__, func_def, imported_kernels, arrays, csr_matrices).render()

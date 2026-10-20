@@ -1,5 +1,5 @@
 import pytest
-from pysol import ArrayElementType, ArrayType, Type
+from pysol import ArrayElementType, ArrayType, CSRBlockType, Type
 
 
 def test_type_members():
@@ -80,3 +80,29 @@ def test_array_element_type_repr():
 def test_array_element_type_invalid_dims():
     with pytest.raises(ValueError):
         ArrayElementType(0, Type.Float)
+
+
+# ---------------------------------------------------------------------------
+# Type.CSRBlock / CSRBlockType
+# ---------------------------------------------------------------------------
+
+def test_type_csr_block_returns_csr_block_type():
+    cb = Type.CSRBlock(Type.Double)
+    assert isinstance(cb, CSRBlockType)
+    assert cb.element_type is Type.Double
+
+
+def test_csr_block_type_equality():
+    assert Type.CSRBlock(Type.Double) == Type.CSRBlock(Type.Double)
+    assert Type.CSRBlock(Type.Double) != Type.CSRBlock(Type.Int)
+
+
+def test_csr_block_type_hashable():
+    s = {Type.CSRBlock(Type.Float), Type.CSRBlock(Type.Float)}
+    assert len(s) == 1
+
+
+def test_csr_block_type_repr():
+    r = repr(Type.CSRBlock(Type.Double))
+    assert "CSRBlockType" in r
+    assert "Double" in r

@@ -6,9 +6,9 @@ import pytest
 
 import pysol as _pysol_mod
 from pysol import (
-    Array, ArrayOperationError, GrowingArray, KernelArgument, NotImportedKernel,
-    UnsupportedCallError, UnsupportedVariableType, Type, import_kernel, pysol,
-    pysol_struct, pysol_update_array,
+    Array, ArrayOperationError, CSRMatrix, GrowingArray, KernelArgument, LATEST_VERSION,
+    NotImportedKernel, UnsupportedCallError, UnsupportedVariableType, Type, import_kernel,
+    pysol, pysol_struct, pysol_update_array, reset,
 )
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
@@ -129,6 +129,21 @@ def test_gen_import_arg_array_element_3d_double():
     ]
 
 
+def test_gen_import_arg_csr_block_in():
+    decls = _gen_import_arg_decl(KernelArgument("a", True, Type.CSRBlock(Type.Double)))
+    assert decls == ["in CSRBlock<double> a"]
+
+
+def test_gen_import_arg_csr_block_out():
+    decls = _gen_import_arg_decl(KernelArgument("b", False, Type.CSRBlock(Type.Float)))
+    assert decls == ["out CSRBlock<float> b"]
+
+
+def test_gen_import_arg_csr_block_int():
+    decls = _gen_import_arg_decl(KernelArgument("c", True, Type.CSRBlock(Type.Int)))
+    assert decls == ["in CSRBlock<int> c"]
+
+
 # ---------------------------------------------------------------------------
 # Import declarations with argument lists
 # ---------------------------------------------------------------------------
@@ -227,6 +242,130 @@ def test_array_decl_string_type():
 
     out = _sol(fn)
     assert "Array<string[8]> s[8];" in out
+
+
+# ---------------------------------------------------------------------------
+# is_single_version -> SingleVersionArray<...> instead of Array<...>
+# ---------------------------------------------------------------------------
+
+def test_array_decl_single_version_positional():
+    def fn():
+        b = Array(1, 1, [9], [2], Type.Double, True)
+
+    out = _sol(fn)
+    assert "SingleVersionArray<double[2]> b[9];" in out
+
+
+def test_array_decl_single_version_keyword():
+    def fn():
+        b = Array(1, 1, [9], [2], Type.Double, is_single_version=True)
+
+    out = _sol(fn)
+    assert "SingleVersionArray<double[2]> b[9];" in out
+
+
+def test_array_decl_single_version_false_is_plain_array():
+    def fn():
+        b = Array(1, 1, [9], [2], Type.Double, is_single_version=False)
+
+    out = _sol(fn)
+    assert "Array<double[2]> b[9];" in out
+    assert "SingleVersionArray" not in out
+
+
+def test_array_decl_single_version_default_is_plain_array():
+    def fn():
+        b = Array(1, 1, [9], [2], Type.Double)
+
+    out = _sol(fn)
+    assert "Array<double[2]> b[9];" in out
+    assert "SingleVersionArray" not in out
+
+
+# ---------------------------------------------------------------------------
+# CSRMatrix declaration
+# ---------------------------------------------------------------------------
+
+def test_csr_matrix_decl_bare_assign():
+    """
+    .sol argument order (dim1, dim2, nnz, n_blocks_1, n_blocks_2, ia, ja, a)
+    differs from the Python constructor's own order (size, n_blocks, nnz,
+    ia, ja, a, type).
+    """
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    out = _sol(fn)
+    assert "BlockedCSRMatrix<double[][]> A = {4, 4, 6, 2, 2, ia, ja, a};" in out
+
+
+def test_csr_matrix_decl_ann_assign():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Float)
+        A: CSRMatrix = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Float)
+
+    out = _sol(fn)
+    assert "BlockedCSRMatrix<float[][]> A = {4, 4, 6, 2, 2, ia, ja, a};" in out
+
+
+def test_csr_matrix_decl_int_type():
+    def fn():
+        ia = Array(1, 1, [3], [1], Type.Int)
+        ja = Array(1, 1, [4], [1], Type.Int)
+        a = Array(1, 1, [4], [1], Type.Int)
+        A = CSRMatrix([2, 2], [1, 1], 4, ia, ja, a, Type.Int)
+
+    out = _sol(fn)
+    assert "BlockedCSRMatrix<int[][]> A = {2, 2, 4, 1, 1, ia, ja, a};" in out
+
+
+def test_csr_matrix_ia_wrong_type_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Double)  # should be Type.Int
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ArrayOperationError):
+        _sol(fn)
+
+
+def test_csr_matrix_ja_wrong_type_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Float)  # should be Type.Int
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ArrayOperationError):
+        _sol(fn)
+
+
+def test_csr_matrix_a_wrong_type_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Float)  # matrix type is Type.Double
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ArrayOperationError):
+        _sol(fn)
+
+
+def test_csr_matrix_ia_wrong_ndims_raises():
+    def fn():
+        ia = Array(2, 1, [5, 5], [1], Type.Int)  # must be 1-D
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ArrayOperationError):
+        _sol(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +476,65 @@ def test_if_or_condition():
 
 
 # ---------------------------------------------------------------------------
+# is_zero(...) condition generation — renders as the .sol macro %zero(...)
+# ---------------------------------------------------------------------------
+
+def test_if_is_zero_var():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        arr = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, arr, Type.Double)
+        bl: Type.CSRBlock(Type.Double) = A[0][1]
+        if is_zero(bl):
+            pass
+
+    out = _sol(fn)
+    assert "if (%zero(bl)) {" in out
+
+
+def test_if_not_is_zero_var():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        arr = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, arr, Type.Double)
+        bl: Type.CSRBlock(Type.Double) = A[0][1]
+        if not is_zero(bl):
+            pass
+
+    out = _sol(fn)
+    assert "if (!%zero(bl)) {" in out
+
+
+def test_if_is_zero_csr_block_subscript():
+    """if is_zero(A[i][j]): — the block subscript is passed inline, unexpanded."""
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        arr = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, arr, Type.Double)
+        if is_zero(A[i][j]):
+            pass
+
+    out = _sol(fn)
+    assert "if (%zero(A[i][j])) {" in out
+
+
+def test_if_not_is_zero_csr_block_subscript():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        arr = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, arr, Type.Double)
+        if not is_zero(A[i][j]):
+            pass
+
+    out = _sol(fn)
+    assert "if (!%zero(A[i][j])) {" in out
+
+
+# ---------------------------------------------------------------------------
 # Kernel call generation
 # ---------------------------------------------------------------------------
 
@@ -379,6 +577,56 @@ def test_array_ref_subscript_expansion():
 
     out = _sol(fn)
     assert "%block_n(arr, 0), %block_n(arr, 1), arr{version}[i][j]" in out
+
+
+# ---------------------------------------------------------------------------
+# LATEST_VERSION — renders as the .sol token %latest
+# ---------------------------------------------------------------------------
+
+def test_latest_version_known_array_kernel_arg():
+    """arr[LATEST_VERSION, i][j] → %block_n(arr, 0), %block_n(arr, 1), arr{%latest}[i][j]"""
+    def fn():
+        arr = Array(1, 2, [10], [4, 8], Type.Float)
+        k = import_kernel("kern", [])
+        k(arr[LATEST_VERSION, i][j])
+
+    out = _sol(fn)
+    assert "%block_n(arr, 0), %block_n(arr, 1), arr{%latest}[i][j]" in out
+
+
+def test_latest_version_known_array_get_expansion():
+    """arr.get(LATEST_VERSION, [i, j]) → %block_n(arr, 0), arr{%latest}[i][j]"""
+    def fn():
+        arr = Array(2, 1, [5, 5], [3], Type.Int)
+        k = import_kernel("kern", [])
+        k(arr.get(LATEST_VERSION, [i, j]))
+
+    out = _sol(fn)
+    assert "kern(%block_n(arr, 0), arr{%latest}[i][j]);" in out
+
+
+def test_latest_version_csr_matrix_kernel_arg():
+    """A[LATEST_VERSION, i][j][k] → A{%latest}[i][j][k] — no %block_n expansion for a CSRMatrix."""
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        arr = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, arr, Type.Double)
+        foo = import_kernel("foo", [])
+        foo(A[LATEST_VERSION, i][j][k])
+
+    out = _sol(fn)
+    assert "foo(A{%latest}[i][j][k]);" in out
+
+
+def test_latest_version_bare_expression():
+    """b = A[LATEST_VERSION, i][j] as a direct (non-kernel-call) expression."""
+    def fn():
+        arr = Array(1, 1, [10], [4], Type.Double)
+        x: Type.Double = arr[LATEST_VERSION, i][0]
+
+    out = _sol(fn)
+    assert "double x = arr{%latest}[i][0];" in out
 
 
 def test_array_get_expansion():
@@ -445,6 +693,61 @@ def test_plain_subscript_mixed_with_scalar_args():
 
     out = _sol(fn)
     assert "kern(n, %block_n(arr, 0), arr[i], n);" in out
+
+
+# ---------------------------------------------------------------------------
+# CSRMatrix / CSRBlock usage: A[i][j] as a kernel-call argument and as the
+# RHS of a Type.CSRBlock(...)-annotated variable. A is never added to
+# self._arrays, so A[i][j] falls through to the generic Subscript renderer
+# (unlike Array's special %block_n expansion above) and is emitted bare.
+# ---------------------------------------------------------------------------
+
+def test_csr_block_inline_kernel_call_arg():
+    """foo(A[i][j]) → foo(A[i][j]) — no %block_n expansion for a CSRMatrix."""
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+        foo = import_kernel("foo", [KernelArgument("a", True, Type.CSRBlock(Type.Double))])
+        foo(A[i][j])
+
+    out = _sol(fn)
+    assert "foo(A[i][j]);" in out
+
+
+def test_csr_block_inline_kernel_call_mixed_with_scalar():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+        foo = import_kernel("foo", [])
+        foo(n, A[i][j], n)
+
+    out = _sol(fn)
+    assert "foo(n, A[i][j], n);" in out
+
+
+def test_csr_block_variable_declaration_from_subscript():
+    """b : Type.CSRBlock(Type.Double) = A[i][j] → CSRBlock<double> b = A[i][j];"""
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+        b: Type.CSRBlock(Type.Double) = A[i][j]
+
+    out = _sol(fn)
+    assert "CSRBlock<double> b = A[i][j];" in out
+
+
+def test_csr_matrix_import_line_with_csr_block_arg():
+    def fn():
+        foo = import_kernel("foo", [KernelArgument("a", True, Type.CSRBlock(Type.Double))])
+
+    out = _sol(fn)
+    assert "import foo(in CSRBlock<double> a);" in out
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +819,18 @@ def test_annotation_pysol_qualified():
     for src in ("x: pysol.Type.Int = 0", "x: pysol.Int = 0"):
         node = ast.parse(src, mode="single").body[0]
         assert _annotation_to_sol_type(node.annotation) == "int", src
+
+
+def test_annotation_csr_block_double():
+    import ast
+    node = ast.parse("x: Type.CSRBlock(Type.Double) = y", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "CSRBlock<double>"
+
+
+def test_annotation_csr_block_int():
+    import ast
+    node = ast.parse("x: Type.CSRBlock(Type.Int) = y", mode="single").body[0]
+    assert _annotation_to_sol_type(node.annotation) == "CSRBlock<int>"
 
 
 def test_annotation_unknown_returns_none():
@@ -665,6 +980,228 @@ def test_binop_right_add_same_prec_no_parens():
 
     out = _sol(fn)
     assert "int n = x + y + z;" in out
+
+
+# ---------------------------------------------------------------------------
+# @ (dot product) operator generation
+# ---------------------------------------------------------------------------
+
+def test_matmul_bare_arrays():
+    """a @ b -> (a, b) for two whole blocked-vector Arrays."""
+    def fn():
+        Rl = Array(1, 1, [9], [2], Type.Double)
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        rho: Type.Double = Rl @ Rr
+
+    out = _sol(fn)
+    assert "double rho = (Rl, Rr);" in out
+
+
+def test_matmul_versioned_operands():
+    """a[v,] @ b[v,] -> (a{v}, b{v}) — whole vector at a given version."""
+    def fn():
+        Rl = Array(1, 1, [9], [2], Type.Double)
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        it: Type.Int = 1
+        rho: Type.Double = Rl[it,] @ Rr[it,]
+
+    out = _sol(fn)
+    assert "double rho = (Rl{it}, Rr{it});" in out
+
+
+def test_matmul_mixed_bare_and_versioned_operands():
+    def fn():
+        Rl = Array(1, 1, [9], [2], Type.Double)
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        it: Type.Int = 1
+        rho: Type.Double = Rl[it,] @ Rr
+
+    out = _sol(fn)
+    assert "double rho = (Rl{it}, Rr);" in out
+
+
+def test_matmul_reassignment():
+    def fn():
+        Rl = Array(1, 1, [9], [2], Type.Double)
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        rho: Type.Double = 0.0
+        rho = Rl @ Rr
+
+    out = _sol(fn)
+    assert "rho = (Rl, Rr);" in out
+
+
+# ---------------------------------------------------------------------------
+# +, -, * on vectors (version-tagged 1-D arrays of 1-D blocks)
+# ---------------------------------------------------------------------------
+
+def test_vector_add():
+    """a[v,] + b[v,] -> a{v} + b{v}"""
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        b = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        k(a[it,] + b[it,])
+
+    out = _sol(fn)
+    assert "k(a{it} + b{it});" in out
+
+
+def test_vector_sub():
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        b = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        k(a[it,] - b[it,])
+
+    out = _sol(fn)
+    assert "k(a{it} - b{it});" in out
+
+
+def test_vector_mul_vector():
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        b = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        k(a[it,] * b[it,])
+
+    out = _sol(fn)
+    assert "k(a{it} * b{it});" in out
+
+
+def test_vector_mul_constant():
+    """a[v,] * c -> a{v} * c, where c is a plain scalar of the same type."""
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        c: Type.Double = 2.0
+        k(a[it,] * c)
+
+    out = _sol(fn)
+    assert "k(a{it} * c);" in out
+
+
+def test_vector_constant_mul_left():
+    """c * a[v,] -> c * a{v} (scalar on the left)."""
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        c: Type.Double = 2.0
+        k(c * a[it,])
+
+    out = _sol(fn)
+    assert "k(c * a{it});" in out
+
+
+def test_vector_nested_axpy_style():
+    """a[v+1,] + c * b[v,] -> a{v + 1} + c * b{v} - precedence keeps this unparenthesized."""
+    def fn():
+        a = Array(1, 1, [9], [2], Type.Double)
+        b = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        c: Type.Double = 2.0
+        k(a[it + 1,] + c * b[it,])
+
+    out = _sol(fn)
+    assert "k(a{it + 1} + c * b{it});" in out
+
+
+def test_vector_axpy_as_kernel_arg():
+    """x[v+1,] + a_c * Pr[v,] used as a kernel-call argument."""
+    def fn():
+        x = Array(1, 1, [9], [2], Type.Double)
+        Pr = Array(1, 1, [9], [2], Type.Double)
+        k = import_kernel("k", [KernelArgument("v", True, Type.Double, 1)])
+        it: Type.Int = 1
+        a_c: Type.Double = 0.5
+        k(x[it,] + a_c * Pr[it,])
+
+    out = _sol(fn)
+    assert "k(x{it} + a_c * Pr{it});" in out
+
+
+def test_vector_whole_assignment_statement():
+    """x[v,] = <vector expr>; -> x{v} = <expr>; - bicg.sol's own
+    "x{1} = x + a_c * Pr;" style, no per-block loop or kernel call needed."""
+    def fn():
+        x = Array(1, 1, [9], [2], Type.Double)
+        Pr = Array(1, 1, [9], [2], Type.Double)
+        it: Type.Int = 1
+        a_c: Type.Double = 0.5
+        x[it + 1,] = x[it,] + a_c * Pr[it,]
+
+    out = _sol(fn)
+    assert "x{it + 1} = x{it} + a_c * Pr{it};" in out
+
+
+def test_vector_whole_assignment_subtraction():
+    def fn():
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        Zr = Array(1, 1, [9], [2], Type.Double)
+        it: Type.Int = 1
+        a_c: Type.Double = 0.5
+        Rr[it + 1,] = Rr[it,] - a_c * Zr[9,]
+
+    out = _sol(fn)
+    assert "Rr{it + 1} = Rr{it} - a_c * Zr{9};" in out
+
+
+# ---------------------------------------------------------------------------
+# "=" plain whole-vector copy (no arithmetic operator)
+# ---------------------------------------------------------------------------
+
+def test_vector_plain_copy_from_versioned_source():
+    """A = B[1,] -> A = B{1}; (bicg.sol's own "Rr = B;" style - A stays bare)."""
+    def fn():
+        A = Array(1, 1, [9], [2], Type.Double)
+        B = Array(1, 1, [9], [2], Type.Double)
+        A = B[1,]
+
+    out = _sol(fn)
+    assert "A = B{1};" in out
+
+
+def test_vector_plain_copy_both_bare():
+    """A = B -> A = B; - matches bicg.sol's "Rr = B;" exactly, no braces at all."""
+    def fn():
+        A = Array(1, 1, [9], [2], Type.Double)
+        B = Array(1, 1, [9], [2], Type.Double)
+        A = B
+
+    out = _sol(fn)
+    assert "A = B;" in out
+
+
+def test_vector_plain_copy_versioned_target():
+    """A[0,] = B[1,] -> A{0} = B{1};"""
+    def fn():
+        A = Array(1, 1, [9], [2], Type.Double)
+        B = Array(1, 1, [9], [2], Type.Double)
+        A[0,] = B[1,]
+
+    out = _sol(fn)
+    assert "A{0} = B{1};" in out
+
+
+def test_vector_plain_copy_multiple_assignments():
+    """Several whole-vector copies in sequence, matching bicg.sol's setup
+    phase (Rr = B; Rl = Rr; Zr = Rr; ...)."""
+    def fn():
+        B = Array(1, 1, [9], [2], Type.Double)
+        Rr = Array(1, 1, [9], [2], Type.Double)
+        Rl = Array(1, 1, [9], [2], Type.Double)
+        Rr = B
+        Rl = Rr
+
+    out = _sol(fn)
+    assert "Rr = B;" in out
+    assert "Rl = Rr;" in out
 
 
 def test_simple_var_bare_reassignment_no_redecl():
@@ -825,6 +1362,90 @@ def test_array_add_incompatible_message_names_arrays():
         C = A + B
 
     with pytest.raises(ArrayOperationError, match="'A'"):
+        _sol(fn)
+
+
+# ---------------------------------------------------------------------------
+# reset(...) .sol generation
+# ---------------------------------------------------------------------------
+
+def test_reset_array():
+    def fn():
+        arr = Array(1, 1, [10], [4], Type.Double)
+        reset(arr)
+
+    out = _sol(fn)
+    assert "arr = {};" in out
+
+
+def test_reset_growing_array():
+    def fn():
+        arr = GrowingArray(1, [10], Type.Int)
+        reset(arr)
+
+    out = _sol(fn)
+    assert "arr = {};" in out
+
+
+def test_reset_csr_matrix():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+        reset(A)
+
+    out = _sol(fn)
+    assert "A = {};" in out
+
+
+def test_reset_inside_for_loop_indented():
+    def fn():
+        arr = Array(1, 1, [10], [4], Type.Double)
+        for i in range(3):
+            reset(arr)
+
+    out = _sol(fn)
+    inner = [l for l in out.splitlines() if l.strip() == "arr = {};"][0]
+    assert inner.startswith("        ")  # 8 spaces = 2 levels
+
+
+def test_reset_qualified_name():
+    def fn():
+        import pysol as _pysol
+        arr = Array(1, 1, [10], [4], Type.Double)
+        _pysol.reset(arr)
+
+    out = _sol(fn)
+    assert "arr = {};" in out
+
+
+def test_reset_wrong_arg_count_raises():
+    def fn():
+        arr = Array(1, 1, [10], [4], Type.Double)
+        reset(arr, arr)
+
+    with pytest.raises(UnsupportedCallError):
+        _sol(fn)
+
+
+def test_reset_no_args_raises():
+    def fn():
+        reset()
+
+    with pytest.raises(UnsupportedCallError):
+        _sol(fn)
+
+
+def test_reset_non_name_arg_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+        reset(A[0][1])
+
+    with pytest.raises(UnsupportedCallError):
         _sol(fn)
 
 

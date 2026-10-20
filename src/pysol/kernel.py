@@ -3,8 +3,8 @@ from __future__ import annotations
 import inspect
 from typing import Callable, Dict, List
 
-from pysol.array import ArrayElement
-from pysol.types import Type
+from pysol.array import ArrayElement, CSRBlock
+from pysol.types import CSRBlockType, Type
 
 
 _PY_TYPE: Dict[Type, type] = {
@@ -41,14 +41,24 @@ class KernelArgument:
     def is_array_element(self) -> bool:
         return self.n_dims > 0
 
+    def _type_str(self) -> str:
+        # self.type is a Type enum member, a struct name (plain str), or a
+        # CSRBlockType (Type.CSRBlock(...)) — each needs its own rendering.
+        t = self.type
+        if isinstance(t, str):
+            return t
+        if hasattr(t, "value"):
+            return t.value
+        return repr(t)
+
     def __repr__(self) -> str:
         direction = "in" if self.is_input else "out"
         if self.is_array_element:
             return (
                 f"KernelArgument({self.name!r}, {direction}, "
-                f"{self.type.value}, n_dims={self.n_dims})"
+                f"{self._type_str()}, n_dims={self.n_dims})"
             )
-        return f"KernelArgument({self.name!r}, {direction}, {self.type.value})"
+        return f"KernelArgument({self.name!r}, {direction}, {self._type_str()})"
 
 
 def import_kernel(name: str, args: List[KernelArgument]) -> Callable:
@@ -56,20 +66,28 @@ def import_kernel(name: str, args: List[KernelArgument]) -> Callable:
     Dynamically create and return a callable named `name` whose parameters
     match `args`.  Python type annotations per argument:
 
-        Scalar  Type.Int           → int
-        Scalar  Type.Float/Double  → float
-        Scalar  Type.String        → str
-        Scalar  Type.Bool          → bool
-        Array element (n_dims>=1)  → ArrayElement
+        Scalar  Type.Int                 → int
+        Scalar  Type.Float/Double        → float
+        Scalar  Type.String              → str
+        Scalar  Type.Bool                → bool
+        Array element (n_dims>=1)        → ArrayElement
+        Type.CSRBlock(...) (n_dims=0)    → CSRBlock
 
     The returned function validates argument types on every call and exposes
     the original KernelArgument metadata via __kernel_args__.
     """
+    def _annotation(arg: KernelArgument) -> type:
+        if arg.is_array_element:
+            return ArrayElement
+        if isinstance(arg.type, CSRBlockType):
+            return CSRBlock
+        return _PY_TYPE[arg.type]
+
     params = [
         inspect.Parameter(
             name=arg.name,
             kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            annotation=ArrayElement if arg.is_array_element else _PY_TYPE[arg.type],
+            annotation=_annotation(arg),
         )
         for arg in args
     ]

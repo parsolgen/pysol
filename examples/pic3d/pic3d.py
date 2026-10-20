@@ -19,7 +19,7 @@ GN, GM, GL = 21, 21, 21
 X0 = (-0.1, -0.1, 0.0)
 XM = (0.1, 0.1, 0.2)
 DH = ((XM[0] - X0[0]) / (GN - 1), (XM[1] - X0[1]) / (GM - 1), (XM[2] - X0[2]) / (GL - 1))
-NUM_TS = 1000
+NUM_TS = 100
 VTI_EVERY = 100  # must match the "ts % 100" check in dump_vti_block
 
 # =============================================================================
@@ -359,7 +359,7 @@ def pic3d():
     dhz : Type.Double = (xmz - x0z) / (gl - 1)
 
     dt : Type.Double = 2e-10
-    num_ts : Type.Int = 1000
+    num_ts : Type.Int = 100
     num_den : Type.Double = 1e11
 
     npx_ion : Type.Int = 11
