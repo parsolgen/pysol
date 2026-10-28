@@ -5,6 +5,7 @@ import os
 from pysol import (
     Array, GrowingArray, KernelArgument, Type, import_kernel, pysol,
     pysol_compile, pysol_run, load_config, pysol_struct,
+    pysol_update_array_3d_26_full_sum,
 )
 
 # Module-level mirror of pic3d() internal mesh/block parameters (the
@@ -16,6 +17,10 @@ INTERIOR = 40
 BN, BM, BL = INTERIOR + 2, INTERIOR + 2, INTERIOR + 2
 NUM_TS = 100
 NTS_DUMP = 5
+# Domain center/spacing mirrors (cx,cy,cz,hx,hy,hz above), needed to locate
+# the center-plane slice index for the ro.cxy/cxz/cyz.NNNNNN files below.
+CX, CY, CZ = 0.5, 0.5, 0.5
+HX, HY, HZ = 1.0 / (NFX * INTERIOR), 1.0 / (NFY * INTERIOR), 1.0 / (NFZ * INTERIOR)
 
 # =============================================================================
 # pysol port of pic3d_common's self-gravitating N-body PIC (NOT
@@ -62,20 +67,49 @@ NTS_DUMP = 5
 #     early on a data-dependent convergence check, so this is a plain
 #     generous fixed count instead of the reference's while(notstop).
 #
-# Known limitation, not introduced by this port: repeated runs of this
-# exact code can report different particle counts partway through the
-# run (confirmed by instrumenting generate_particles_disk_k directly -
-# generation itself is exact and deterministic, 1000996 particles every
-# time; count_particles_k readings taken later, after several push/merge
-# rounds, are what drift). A merge_particles_block call was observed
-# producing a cell_new SMALLER than its own from_self input alone, which
-# is impossible from the code as written - this points to a scheduling
-# race on cross-fragment GrowingArray reads through if-computed mailbox
-# indices, the same class of RTS-level non-determinism already reported
-# for pysol's other pic3d port (examples/pic3d) - the more/heavier
-# fragments there are, the more likely it is to be hit: a few dozen
-# particles across 8 fragments barely show it, ~1,000,000 particles
-# across the current 1000 (10x10x10) fragments show it readily.
+# Known limitation, partially root-caused: there were actually TWO
+# distinct bugs hiding behind the single symptom "n_particles/KE printed
+# per step drifts under multithreading."
+#
+# (1) FIXED: count_particles_k/sum_kinetic_energy_k (now removed) wrote
+# into one SHARED scalar via += across every one of the nfx*nfy*nfz
+# kernel calls in a timestep, with no synchronization - a plain lost-
+# update race confined to that diagnostic accumulator. Confirmed via
+# independent per-fragment particle dumps cross-checked against the
+# printed diagnostic (40+ repeated runs, up to 1000 fragments, ~282,000
+# particles, 20 OMP threads): the actual particle data was exact and
+# identical to the single-threaded baseline in every run, including ones
+# where the OLD printed total was wrong - the simulation was never
+# losing particles at that scale, only the diagnostic's own total was.
+# See particle_diag_block in ucodes.h for the fix (each fragment writes
+# its own count/KE into its own Array cell; the total is a real sgc
+# sum() reduction, not a hand-rolled one).
+#
+# (2) NOT FIXED, confirmed real and distinct from (1): at the reference's
+# actual scale (1,000,996 particles, bn=bm=bl=42, nfx=nfy=nfz=10), the
+# same independent-dump method shows genuine particle-data corruption
+# under multithreading (10 OMP threads) that (1)'s fix does not touch -
+# e.g. one 3-timestep run showed 18 distinct (timestep, fragment) cells
+# with particle counts AND proportionally-scaled KE differing from the
+# 1-thread baseline (not just the count, which is what distinguishes
+# this from bug (1)). Every single differing fragment was in the k=5
+# layer - not a coincidence: every particle's initial z equals cx/cy/cz's
+# cz=0.5 exactly (see generate_particles_disk_k), so the ENTIRE initial
+# particle population starts in one single z-layer of fragments instead
+# of being spread across all ten, a ~100x per-fragment load imbalance
+# relative to every other z-layer at ts=0. This is almost certainly why
+# it wasn't reproducible at smaller scales tested while chasing bug (1)
+# (up to 282,000 particles, same skewed-IC shape but a proportionally
+# much smaller absolute imbalance) - this looks like a genuine RTS-level
+# race in GrowingArray cross-fragment read/write synchronization that
+# only gets exposed under heavy, uneven per-fragment load, the same class
+# of issue originally (and, it turns out, only partially correctly)
+# blamed for bug (1). No reliable pic3d.py/ucodes.h-only workaround for
+# this one was found - see push_particles_block/merge_particles_block in
+# ucodes.h. Until it's fixed (most likely needs RTS-level work, out of
+# this port's scope), run with OMP_NUM_THREADS=1 at the reference's full
+# particle/fragment scale specifically; smaller configurations (as
+# exercised by this repo's own tests) were not observed to be affected.
 # =============================================================================
 
 
@@ -125,61 +159,26 @@ def pic3d_pysol():
                                            KernelArgument("cell", True, Particle),
                                            KernelArgument("den_raw", False, Type.Double, 3)])
 
-    exchange_density_additive_k = import_kernel("exchange_density_additive_block",
-                                                [KernelArgument("self_raw", True, Type.Double, 3),
-        KernelArgument("nbr000", True, Type.Double, 3),
-        KernelArgument("exists000", True, Type.Int),
-        KernelArgument("nbr001", True, Type.Double, 3),
-        KernelArgument("exists001", True, Type.Int),
-        KernelArgument("nbr002", True, Type.Double, 3),
-        KernelArgument("exists002", True, Type.Int),
-        KernelArgument("nbr010", True, Type.Double, 3),
-        KernelArgument("exists010", True, Type.Int),
-        KernelArgument("nbr011", True, Type.Double, 3),
-        KernelArgument("exists011", True, Type.Int),
-        KernelArgument("nbr012", True, Type.Double, 3),
-        KernelArgument("exists012", True, Type.Int),
-        KernelArgument("nbr020", True, Type.Double, 3),
-        KernelArgument("exists020", True, Type.Int),
-        KernelArgument("nbr021", True, Type.Double, 3),
-        KernelArgument("exists021", True, Type.Int),
-        KernelArgument("nbr022", True, Type.Double, 3),
-        KernelArgument("exists022", True, Type.Int),
-        KernelArgument("nbr100", True, Type.Double, 3),
-        KernelArgument("exists100", True, Type.Int),
-        KernelArgument("nbr101", True, Type.Double, 3),
-        KernelArgument("exists101", True, Type.Int),
-        KernelArgument("nbr102", True, Type.Double, 3),
-        KernelArgument("exists102", True, Type.Int),
-        KernelArgument("nbr110", True, Type.Double, 3),
-        KernelArgument("exists110", True, Type.Int),
-        KernelArgument("nbr112", True, Type.Double, 3),
-        KernelArgument("exists112", True, Type.Int),
-        KernelArgument("nbr120", True, Type.Double, 3),
-        KernelArgument("exists120", True, Type.Int),
-        KernelArgument("nbr121", True, Type.Double, 3),
-        KernelArgument("exists121", True, Type.Int),
-        KernelArgument("nbr122", True, Type.Double, 3),
-        KernelArgument("exists122", True, Type.Int),
-        KernelArgument("nbr200", True, Type.Double, 3),
-        KernelArgument("exists200", True, Type.Int),
-        KernelArgument("nbr201", True, Type.Double, 3),
-        KernelArgument("exists201", True, Type.Int),
-        KernelArgument("nbr202", True, Type.Double, 3),
-        KernelArgument("exists202", True, Type.Int),
-        KernelArgument("nbr210", True, Type.Double, 3),
-        KernelArgument("exists210", True, Type.Int),
-        KernelArgument("nbr211", True, Type.Double, 3),
-        KernelArgument("exists211", True, Type.Int),
-        KernelArgument("nbr212", True, Type.Double, 3),
-        KernelArgument("exists212", True, Type.Int),
-        KernelArgument("nbr220", True, Type.Double, 3),
-        KernelArgument("exists220", True, Type.Int),
-        KernelArgument("nbr221", True, Type.Double, 3),
-        KernelArgument("exists221", True, Type.Int),
-        KernelArgument("nbr222", True, Type.Double, 3),
-        KernelArgument("exists222", True, Type.Int),
-                                                 KernelArgument("merged", False, Type.Double, 3)])
+    # Stage 1 ("read") of the potential exchange's two-stage ghost-exchange
+    # split: copies a block's own data into a stable scratch array before
+    # any neighbor reads it, the same way pysol_update_array's
+    # _read_ghost3d_ kernel (see exchange_3d.sol) extracts a block's own
+    # data before any other block's stage-2 write can run - ParSolGen
+    # can't read and write the same array element within one kernel, so
+    # the read (copy into the stable scratch) and the write (the actual
+    # exchange, reading only from that now-settled scratch copy) must be
+    # two separate kernel-call passes, not one combined pass. The density
+    # exchange used to need this same split too, via its own
+    # exchange_density_additive_block kernel - that is now the generic
+    # pysol_update_array_3d_26_full_sum runtime primitive instead (see
+    # exchange_3d_26_full_sum.sol), which does its own stage-1/stage-2
+    # split internally.
+    copy_block3d_k = import_kernel("copy_block3d",
+                                    [KernelArgument("n", True, Type.Int),
+                                     KernelArgument("m", True, Type.Int),
+                                     KernelArgument("l", True, Type.Int),
+                                     KernelArgument("a", True, Type.Double, 3),
+                                     KernelArgument("b", False, Type.Double, 3)])
 
     exchange_potential_copy_k = import_kernel("exchange_potential_copy_block",
                                               [KernelArgument("self_fi", True, Type.Double, 3),
@@ -396,17 +395,19 @@ def pic3d_pysol():
         KernelArgument("exists222", True, Type.Int),
                                        KernelArgument("cell_new", False, Particle)])
 
-    count_particles_k = import_kernel("count_particles_k",
-                                      [KernelArgument("cell", True, Particle),
-                                       KernelArgument("count", False, Type.Int)])
-
-    sum_kinetic_energy_k = import_kernel("sum_kinetic_energy_k",
-                                         [KernelArgument("cell", True, Particle),
-                                          KernelArgument("ke_sum", False, Type.Double)])
+    # Race-free per-fragment diagnostic (see particle_diag_block in
+    # ucodes.h for why count_particles_k/sum_kinetic_energy_k's old
+    # shared-accumulator pattern is gone): each fragment writes into its
+    # own distinct cell of n_particles_per_frag/ke_per_frag below, and the
+    # whole-domain total is a real sgc sum() reduction over that Array.
+    particle_diag_k = import_kernel("particle_diag_block",
+                                     [KernelArgument("cell", True, Particle),
+                                      KernelArgument("count_out", False, Type.Double, 3),
+                                      KernelArgument("ke_out", False, Type.Double, 3)])
 
     print_step_k = import_kernel("print_step",
                                  [KernelArgument("ts", True, Type.Int),
-                                  KernelArgument("n_particles", True, Type.Int),
+                                  KernelArgument("n_particles", True, Type.Double),
                                   KernelArgument("ke", True, Type.Double)])
 
     dump_density_k = import_kernel("dump_density_block",
@@ -512,7 +513,23 @@ def pic3d_pysol():
     fy = Array(3, 3, [nfx, nfy, nfz], [bn, bm, bl], Type.Double)
     fz = Array(3, 3, [nfx, nfy, nfz], [bn, bm, bl], Type.Double)
 
+    # Stage-1 scratch copy for the potential exchange's two-stage ghost
+    # exchange (see copy_block3d_k above) - every block's own potential
+    # data is copied here first, so exchange_potential_copy_k's neighbor
+    # reads (stage 2) never read an array a concurrently-running task
+    # might still be writing. Reused (overwritten) for every exchange
+    # call, always at version 0 - each stage-1 pass fully completes before
+    # its matching stage-2 pass starts reading it, so no further
+    # versioning is needed here. The density exchange needed an analogous
+    # ro_raw_stable scratch array too, but pysol_update_array_3d_26_full_sum
+    # now keeps its own internal scratch, so that array is gone.
+    fp_stable = Array(3, 3, [nfx, nfy, nfz], [bn, bm, bl], Type.Double)
+
     particles = GrowingArray(3, [nfx, nfy, nfz], Particle)
+    # Per-fragment diagnostic scratch (see particle_diag_k above) - one
+    # cell per fragment, no ghost margin needed.
+    n_particles_per_frag = Array(3, 3, [nfx, nfy, nfz], [1, 1, 1], Type.Double)
+    ke_per_frag = Array(3, 3, [nfx, nfy, nfz], [1, 1, 1], Type.Double)
     mail_self = GrowingArray(3, [nfx, nfy, nfz], Particle)
     mail_000 = GrowingArray(3, [nfx, nfy, nfz], Particle)
     mail_001 = GrowingArray(3, [nfx, nfy, nfz], Particle)
@@ -632,99 +649,14 @@ def pic3d_pysol():
                     compute_density_raw_k(hx, hy, hz, am, i, j, k, bn - 2, bm - 2, bl - 2,
                                           particles[0, i][j][k], ro_raw[i][j][k])
 
-    for i in range(nfx):
-            for j in range(nfy):
-                for k in range(nfz):
-                    has_lo_x_s2 : Type.Int = 1
-                    has_hi_x_s2 : Type.Int = 1
-                    has_lo_y_s2 : Type.Int = 1
-                    has_hi_y_s2 : Type.Int = 1
-                    has_lo_z_s2 : Type.Int = 1
-                    has_hi_z_s2 : Type.Int = 1
-                    if i == 0:
-                        has_lo_x_s2 = 0
-                    if i == nfx_last:
-                        has_hi_x_s2 = 0
-                    if j == 0:
-                        has_lo_y_s2 = 0
-                    if j == nfy_last:
-                        has_hi_y_s2 = 0
-                    if k == 0:
-                        has_lo_z_s2 = 0
-                    if k == nfz_last:
-                        has_hi_z_s2 = 0
-                    im1_s2 : Type.Int = i - 1
-                    ip1_s2 : Type.Int = i + 1
-                    jm1_s2 : Type.Int = j - 1
-                    jp1_s2 : Type.Int = j + 1
-                    km1_s2 : Type.Int = k - 1
-                    kp1_s2 : Type.Int = k + 1
-                    if i == 0:
-                        im1_s2 = i
-                    if i == nfx_last:
-                        ip1_s2 = i
-                    if j == 0:
-                        jm1_s2 = j
-                    if j == nfy_last:
-                        jp1_s2 = j
-                    if k == 0:
-                        km1_s2 = k
-                    if k == nfz_last:
-                        kp1_s2 = k
-                    exists_000_s2 : Type.Int = has_lo_x_s2 * has_lo_y_s2 * has_lo_z_s2
-                    exists_001_s2 : Type.Int = has_lo_x_s2 * has_lo_y_s2
-                    exists_002_s2 : Type.Int = has_lo_x_s2 * has_lo_y_s2 * has_hi_z_s2
-                    exists_010_s2 : Type.Int = has_lo_x_s2 * has_lo_z_s2
-                    exists_011_s2 : Type.Int = has_lo_x_s2
-                    exists_012_s2 : Type.Int = has_lo_x_s2 * has_hi_z_s2
-                    exists_020_s2 : Type.Int = has_lo_x_s2 * has_hi_y_s2 * has_lo_z_s2
-                    exists_021_s2 : Type.Int = has_lo_x_s2 * has_hi_y_s2
-                    exists_022_s2 : Type.Int = has_lo_x_s2 * has_hi_y_s2 * has_hi_z_s2
-                    exists_100_s2 : Type.Int = has_lo_y_s2 * has_lo_z_s2
-                    exists_101_s2 : Type.Int = has_lo_y_s2
-                    exists_102_s2 : Type.Int = has_lo_y_s2 * has_hi_z_s2
-                    exists_110_s2 : Type.Int = has_lo_z_s2
-                    exists_112_s2 : Type.Int = has_hi_z_s2
-                    exists_120_s2 : Type.Int = has_hi_y_s2 * has_lo_z_s2
-                    exists_121_s2 : Type.Int = has_hi_y_s2
-                    exists_122_s2 : Type.Int = has_hi_y_s2 * has_hi_z_s2
-                    exists_200_s2 : Type.Int = has_hi_x_s2 * has_lo_y_s2 * has_lo_z_s2
-                    exists_201_s2 : Type.Int = has_hi_x_s2 * has_lo_y_s2
-                    exists_202_s2 : Type.Int = has_hi_x_s2 * has_lo_y_s2 * has_hi_z_s2
-                    exists_210_s2 : Type.Int = has_hi_x_s2 * has_lo_z_s2
-                    exists_211_s2 : Type.Int = has_hi_x_s2
-                    exists_212_s2 : Type.Int = has_hi_x_s2 * has_hi_z_s2
-                    exists_220_s2 : Type.Int = has_hi_x_s2 * has_hi_y_s2 * has_lo_z_s2
-                    exists_221_s2 : Type.Int = has_hi_x_s2 * has_hi_y_s2
-                    exists_222_s2 : Type.Int = has_hi_x_s2 * has_hi_y_s2 * has_hi_z_s2
-                    exchange_density_additive_k(ro_raw[i][j][k],
-                                                   ro_raw[im1_s2][jm1_s2][km1_s2], exists_000_s2,
-                                                   ro_raw[im1_s2][jm1_s2][k], exists_001_s2,
-                                                   ro_raw[im1_s2][jm1_s2][kp1_s2], exists_002_s2,
-                                                   ro_raw[im1_s2][j][km1_s2], exists_010_s2,
-                                                   ro_raw[im1_s2][j][k], exists_011_s2,
-                                                   ro_raw[im1_s2][j][kp1_s2], exists_012_s2,
-                                                   ro_raw[im1_s2][jp1_s2][km1_s2], exists_020_s2,
-                                                   ro_raw[im1_s2][jp1_s2][k], exists_021_s2,
-                                                   ro_raw[im1_s2][jp1_s2][kp1_s2], exists_022_s2,
-                                                   ro_raw[i][jm1_s2][km1_s2], exists_100_s2,
-                                                   ro_raw[i][jm1_s2][k], exists_101_s2,
-                                                   ro_raw[i][jm1_s2][kp1_s2], exists_102_s2,
-                                                   ro_raw[i][j][km1_s2], exists_110_s2,
-                                                   ro_raw[i][j][kp1_s2], exists_112_s2,
-                                                   ro_raw[i][jp1_s2][km1_s2], exists_120_s2,
-                                                   ro_raw[i][jp1_s2][k], exists_121_s2,
-                                                   ro_raw[i][jp1_s2][kp1_s2], exists_122_s2,
-                                                   ro_raw[ip1_s2][jm1_s2][km1_s2], exists_200_s2,
-                                                   ro_raw[ip1_s2][jm1_s2][k], exists_201_s2,
-                                                   ro_raw[ip1_s2][jm1_s2][kp1_s2], exists_202_s2,
-                                                   ro_raw[ip1_s2][j][km1_s2], exists_210_s2,
-                                                   ro_raw[ip1_s2][j][k], exists_211_s2,
-                                                   ro_raw[ip1_s2][j][kp1_s2], exists_212_s2,
-                                                   ro_raw[ip1_s2][jp1_s2][km1_s2], exists_220_s2,
-                                                   ro_raw[ip1_s2][jp1_s2][k], exists_221_s2,
-                                                   ro_raw[ip1_s2][jp1_s2][kp1_s2], exists_222_s2,
-                                                 ro[i][j][k])
+    # The additive 26-neighbor exchange itself (read raw into a stable
+    # scratch copy, then sum every existing neighbor's overlapping slab on
+    # top of a self-copy) is now the generic runtime primitive
+    # pysol_update_array_3d_26_full_sum - see
+    # src/pysol/exchange_3d_26_full_sum.sol - which replaces the
+    # copy_block3d_k + exchange_density_additive_k two-stage call pair this
+    # site used before.
+    pysol_update_array_3d_26_full_sum(ro_raw, 0, ro, 0)
 
     # -- initial Poisson solve (plain weighted Jacobi, w=1.0 - the reference's
     # own default - so no SOR/Gauss-Seidel approximation is needed here; "it"
@@ -738,6 +670,14 @@ def pic3d_pysol():
                     for k in range(nfz):
                         poisson_jacobi_sweep_k(hx, hy, hz, w_relax, ro[i][j][k], fp[it, i][j][k],
                                                fp[it + 1, i][j][k])
+            # Stage 1 ("read"): snapshot every block's own fresh fp[it+1]
+            # before the exchange below reads any of them as a neighbor.
+            for i in range(nfx):
+                for j in range(nfy):
+                    for k in range(nfz):
+                        copy_block3d_k(bn, bm, bl, fp[it + 1, i][j][k], fp_stable[it, i][j][k])
+            # Stage 2 ("write"): every neighbor read below comes from
+            # fp_stable (fully settled by stage 1), never fp[it+1] itself.
             for i in range(nfx):
                 for j in range(nfy):
                     for k in range(nfz):
@@ -804,32 +744,32 @@ def pic3d_pysol():
                         exists_221_s3 : Type.Int = has_hi_x_s3 * has_hi_y_s3
                         exists_222_s3 : Type.Int = has_hi_x_s3 * has_hi_y_s3 * has_hi_z_s3
                         exchange_potential_copy_k(fp[it + 1, i][j][k],
-                                                     fp[it + 1, im1_s3][jm1_s3][km1_s3], exists_000_s3,
-                                                     fp[it + 1, im1_s3][jm1_s3][k], exists_001_s3,
-                                                     fp[it + 1, im1_s3][jm1_s3][kp1_s3], exists_002_s3,
-                                                     fp[it + 1, im1_s3][j][km1_s3], exists_010_s3,
-                                                     fp[it + 1, im1_s3][j][k], exists_011_s3,
-                                                     fp[it + 1, im1_s3][j][kp1_s3], exists_012_s3,
-                                                     fp[it + 1, im1_s3][jp1_s3][km1_s3], exists_020_s3,
-                                                     fp[it + 1, im1_s3][jp1_s3][k], exists_021_s3,
-                                                     fp[it + 1, im1_s3][jp1_s3][kp1_s3], exists_022_s3,
-                                                     fp[it + 1, i][jm1_s3][km1_s3], exists_100_s3,
-                                                     fp[it + 1, i][jm1_s3][k], exists_101_s3,
-                                                     fp[it + 1, i][jm1_s3][kp1_s3], exists_102_s3,
-                                                     fp[it + 1, i][j][km1_s3], exists_110_s3,
-                                                     fp[it + 1, i][j][kp1_s3], exists_112_s3,
-                                                     fp[it + 1, i][jp1_s3][km1_s3], exists_120_s3,
-                                                     fp[it + 1, i][jp1_s3][k], exists_121_s3,
-                                                     fp[it + 1, i][jp1_s3][kp1_s3], exists_122_s3,
-                                                     fp[it + 1, ip1_s3][jm1_s3][km1_s3], exists_200_s3,
-                                                     fp[it + 1, ip1_s3][jm1_s3][k], exists_201_s3,
-                                                     fp[it + 1, ip1_s3][jm1_s3][kp1_s3], exists_202_s3,
-                                                     fp[it + 1, ip1_s3][j][km1_s3], exists_210_s3,
-                                                     fp[it + 1, ip1_s3][j][k], exists_211_s3,
-                                                     fp[it + 1, ip1_s3][j][kp1_s3], exists_212_s3,
-                                                     fp[it + 1, ip1_s3][jp1_s3][km1_s3], exists_220_s3,
-                                                     fp[it + 1, ip1_s3][jp1_s3][k], exists_221_s3,
-                                                     fp[it + 1, ip1_s3][jp1_s3][kp1_s3], exists_222_s3,
+                                                     fp_stable[it, im1_s3][jm1_s3][km1_s3], exists_000_s3,
+                                                     fp_stable[it, im1_s3][jm1_s3][k], exists_001_s3,
+                                                     fp_stable[it, im1_s3][jm1_s3][kp1_s3], exists_002_s3,
+                                                     fp_stable[it, im1_s3][j][km1_s3], exists_010_s3,
+                                                     fp_stable[it, im1_s3][j][k], exists_011_s3,
+                                                     fp_stable[it, im1_s3][j][kp1_s3], exists_012_s3,
+                                                     fp_stable[it, im1_s3][jp1_s3][km1_s3], exists_020_s3,
+                                                     fp_stable[it, im1_s3][jp1_s3][k], exists_021_s3,
+                                                     fp_stable[it, im1_s3][jp1_s3][kp1_s3], exists_022_s3,
+                                                     fp_stable[it, i][jm1_s3][km1_s3], exists_100_s3,
+                                                     fp_stable[it, i][jm1_s3][k], exists_101_s3,
+                                                     fp_stable[it, i][jm1_s3][kp1_s3], exists_102_s3,
+                                                     fp_stable[it, i][j][km1_s3], exists_110_s3,
+                                                     fp_stable[it, i][j][kp1_s3], exists_112_s3,
+                                                     fp_stable[it, i][jp1_s3][km1_s3], exists_120_s3,
+                                                     fp_stable[it, i][jp1_s3][k], exists_121_s3,
+                                                     fp_stable[it, i][jp1_s3][kp1_s3], exists_122_s3,
+                                                     fp_stable[it, ip1_s3][jm1_s3][km1_s3], exists_200_s3,
+                                                     fp_stable[it, ip1_s3][jm1_s3][k], exists_201_s3,
+                                                     fp_stable[it, ip1_s3][jm1_s3][kp1_s3], exists_202_s3,
+                                                     fp_stable[it, ip1_s3][j][km1_s3], exists_210_s3,
+                                                     fp_stable[it, ip1_s3][j][k], exists_211_s3,
+                                                     fp_stable[it, ip1_s3][j][kp1_s3], exists_212_s3,
+                                                     fp_stable[it, ip1_s3][jp1_s3][km1_s3], exists_220_s3,
+                                                     fp_stable[it, ip1_s3][jp1_s3][k], exists_221_s3,
+                                                     fp_stable[it, ip1_s3][jp1_s3][kp1_s3], exists_222_s3,
                                                    fp[it + 2, i][j][k])
             it = it + 2
 
@@ -911,7 +851,7 @@ def pic3d_pysol():
                         exists_221_s4 : Type.Int = has_hi_x_s4 * has_hi_y_s4
                         exists_222_s4 : Type.Int = has_hi_x_s4 * has_hi_y_s4 * has_hi_z_s4
                         push_particles_k(tau, xn, yn, zn, hx, hy, hz, i, j, k, bn - 2, bm - 2, bl - 2,
-                                         fx[i][j][k], fy[i][j][k], fz[i][j][k],
+                                         fx[pv, i][j][k], fy[pv, i][j][k], fz[pv, i][j][k],
                                          particles[pv, i][j][k],
                                          mail_self[pv + 1, i][j][k],
                                          mail_000[pv + 1, i][j][k],
@@ -1039,108 +979,27 @@ def pic3d_pysol():
                 for j in range(nfy):
                     for k in range(nfz):
                         compute_density_raw_k(hx, hy, hz, am, i, j, k, bn - 2, bm - 2, bl - 2,
-                                              particles[pv + 2, i][j][k], ro_raw[i][j][k])
+                                              particles[pv + 2, i][j][k], ro_raw[pv, i][j][k])
 
-            for i in range(nfx):
-                for j in range(nfy):
-                    for k in range(nfz):
-                        has_lo_x_s6 : Type.Int = 1
-                        has_hi_x_s6 : Type.Int = 1
-                        has_lo_y_s6 : Type.Int = 1
-                        has_hi_y_s6 : Type.Int = 1
-                        has_lo_z_s6 : Type.Int = 1
-                        has_hi_z_s6 : Type.Int = 1
-                        if i == 0:
-                            has_lo_x_s6 = 0
-                        if i == nfx_last:
-                            has_hi_x_s6 = 0
-                        if j == 0:
-                            has_lo_y_s6 = 0
-                        if j == nfy_last:
-                            has_hi_y_s6 = 0
-                        if k == 0:
-                            has_lo_z_s6 = 0
-                        if k == nfz_last:
-                            has_hi_z_s6 = 0
-                        im1_s6 : Type.Int = i - 1
-                        ip1_s6 : Type.Int = i + 1
-                        jm1_s6 : Type.Int = j - 1
-                        jp1_s6 : Type.Int = j + 1
-                        km1_s6 : Type.Int = k - 1
-                        kp1_s6 : Type.Int = k + 1
-                        if i == 0:
-                            im1_s6 = i
-                        if i == nfx_last:
-                            ip1_s6 = i
-                        if j == 0:
-                            jm1_s6 = j
-                        if j == nfy_last:
-                            jp1_s6 = j
-                        if k == 0:
-                            km1_s6 = k
-                        if k == nfz_last:
-                            kp1_s6 = k
-                        exists_000_s6 : Type.Int = has_lo_x_s6 * has_lo_y_s6 * has_lo_z_s6
-                        exists_001_s6 : Type.Int = has_lo_x_s6 * has_lo_y_s6
-                        exists_002_s6 : Type.Int = has_lo_x_s6 * has_lo_y_s6 * has_hi_z_s6
-                        exists_010_s6 : Type.Int = has_lo_x_s6 * has_lo_z_s6
-                        exists_011_s6 : Type.Int = has_lo_x_s6
-                        exists_012_s6 : Type.Int = has_lo_x_s6 * has_hi_z_s6
-                        exists_020_s6 : Type.Int = has_lo_x_s6 * has_hi_y_s6 * has_lo_z_s6
-                        exists_021_s6 : Type.Int = has_lo_x_s6 * has_hi_y_s6
-                        exists_022_s6 : Type.Int = has_lo_x_s6 * has_hi_y_s6 * has_hi_z_s6
-                        exists_100_s6 : Type.Int = has_lo_y_s6 * has_lo_z_s6
-                        exists_101_s6 : Type.Int = has_lo_y_s6
-                        exists_102_s6 : Type.Int = has_lo_y_s6 * has_hi_z_s6
-                        exists_110_s6 : Type.Int = has_lo_z_s6
-                        exists_112_s6 : Type.Int = has_hi_z_s6
-                        exists_120_s6 : Type.Int = has_hi_y_s6 * has_lo_z_s6
-                        exists_121_s6 : Type.Int = has_hi_y_s6
-                        exists_122_s6 : Type.Int = has_hi_y_s6 * has_hi_z_s6
-                        exists_200_s6 : Type.Int = has_hi_x_s6 * has_lo_y_s6 * has_lo_z_s6
-                        exists_201_s6 : Type.Int = has_hi_x_s6 * has_lo_y_s6
-                        exists_202_s6 : Type.Int = has_hi_x_s6 * has_lo_y_s6 * has_hi_z_s6
-                        exists_210_s6 : Type.Int = has_hi_x_s6 * has_lo_z_s6
-                        exists_211_s6 : Type.Int = has_hi_x_s6
-                        exists_212_s6 : Type.Int = has_hi_x_s6 * has_hi_z_s6
-                        exists_220_s6 : Type.Int = has_hi_x_s6 * has_hi_y_s6 * has_lo_z_s6
-                        exists_221_s6 : Type.Int = has_hi_x_s6 * has_hi_y_s6
-                        exists_222_s6 : Type.Int = has_hi_x_s6 * has_hi_y_s6 * has_hi_z_s6
-                        exchange_density_additive_k(ro_raw[i][j][k],
-                                                       ro_raw[im1_s6][jm1_s6][km1_s6], exists_000_s6,
-                                                       ro_raw[im1_s6][jm1_s6][k], exists_001_s6,
-                                                       ro_raw[im1_s6][jm1_s6][kp1_s6], exists_002_s6,
-                                                       ro_raw[im1_s6][j][km1_s6], exists_010_s6,
-                                                       ro_raw[im1_s6][j][k], exists_011_s6,
-                                                       ro_raw[im1_s6][j][kp1_s6], exists_012_s6,
-                                                       ro_raw[im1_s6][jp1_s6][km1_s6], exists_020_s6,
-                                                       ro_raw[im1_s6][jp1_s6][k], exists_021_s6,
-                                                       ro_raw[im1_s6][jp1_s6][kp1_s6], exists_022_s6,
-                                                       ro_raw[i][jm1_s6][km1_s6], exists_100_s6,
-                                                       ro_raw[i][jm1_s6][k], exists_101_s6,
-                                                       ro_raw[i][jm1_s6][kp1_s6], exists_102_s6,
-                                                       ro_raw[i][j][km1_s6], exists_110_s6,
-                                                       ro_raw[i][j][kp1_s6], exists_112_s6,
-                                                       ro_raw[i][jp1_s6][km1_s6], exists_120_s6,
-                                                       ro_raw[i][jp1_s6][k], exists_121_s6,
-                                                       ro_raw[i][jp1_s6][kp1_s6], exists_122_s6,
-                                                       ro_raw[ip1_s6][jm1_s6][km1_s6], exists_200_s6,
-                                                       ro_raw[ip1_s6][jm1_s6][k], exists_201_s6,
-                                                       ro_raw[ip1_s6][jm1_s6][kp1_s6], exists_202_s6,
-                                                       ro_raw[ip1_s6][j][km1_s6], exists_210_s6,
-                                                       ro_raw[ip1_s6][j][k], exists_211_s6,
-                                                       ro_raw[ip1_s6][j][kp1_s6], exists_212_s6,
-                                                       ro_raw[ip1_s6][jp1_s6][km1_s6], exists_220_s6,
-                                                       ro_raw[ip1_s6][jp1_s6][k], exists_221_s6,
-                                                       ro_raw[ip1_s6][jp1_s6][kp1_s6], exists_222_s6,
-                                                     ro[i][j][k])
+            # 26-neighbor additive exchange - see the comment at the
+            # initial-density call site above.
+            pysol_update_array_3d_26_full_sum(ro_raw, pv, ro, pv + 1)
 
             for sweep in range(max_jacobi_iters):
                 for i in range(nfx):
                     for j in range(nfy):
                         for k in range(nfz):
-                            poisson_jacobi_sweep_k(hx, hy, hz, w_relax, ro[i][j][k], fp[it, i][j][k],
+                            poisson_jacobi_sweep_k(hx, hy, hz, w_relax, ro[pv + 1, i][j][k], fp[it, i][j][k],
                                                    fp[it + 1, i][j][k])
+                # Stage 1 ("read"): snapshot every block's own fresh
+                # fp[it+1] before the exchange below reads any of them as
+                # a neighbor.
+                for i in range(nfx):
+                    for j in range(nfy):
+                        for k in range(nfz):
+                            copy_block3d_k(bn, bm, bl, fp[it + 1, i][j][k], fp_stable[it, i][j][k])
+                # Stage 2 ("write"): every neighbor read below comes from
+                # fp_stable, never fp[it+1] itself.
                 for i in range(nfx):
                     for j in range(nfy):
                         for k in range(nfz):
@@ -1207,32 +1066,32 @@ def pic3d_pysol():
                             exists_221_s7 : Type.Int = has_hi_x_s7 * has_hi_y_s7
                             exists_222_s7 : Type.Int = has_hi_x_s7 * has_hi_y_s7 * has_hi_z_s7
                             exchange_potential_copy_k(fp[it + 1, i][j][k],
-                                                         fp[it + 1, im1_s7][jm1_s7][km1_s7], exists_000_s7,
-                                                         fp[it + 1, im1_s7][jm1_s7][k], exists_001_s7,
-                                                         fp[it + 1, im1_s7][jm1_s7][kp1_s7], exists_002_s7,
-                                                         fp[it + 1, im1_s7][j][km1_s7], exists_010_s7,
-                                                         fp[it + 1, im1_s7][j][k], exists_011_s7,
-                                                         fp[it + 1, im1_s7][j][kp1_s7], exists_012_s7,
-                                                         fp[it + 1, im1_s7][jp1_s7][km1_s7], exists_020_s7,
-                                                         fp[it + 1, im1_s7][jp1_s7][k], exists_021_s7,
-                                                         fp[it + 1, im1_s7][jp1_s7][kp1_s7], exists_022_s7,
-                                                         fp[it + 1, i][jm1_s7][km1_s7], exists_100_s7,
-                                                         fp[it + 1, i][jm1_s7][k], exists_101_s7,
-                                                         fp[it + 1, i][jm1_s7][kp1_s7], exists_102_s7,
-                                                         fp[it + 1, i][j][km1_s7], exists_110_s7,
-                                                         fp[it + 1, i][j][kp1_s7], exists_112_s7,
-                                                         fp[it + 1, i][jp1_s7][km1_s7], exists_120_s7,
-                                                         fp[it + 1, i][jp1_s7][k], exists_121_s7,
-                                                         fp[it + 1, i][jp1_s7][kp1_s7], exists_122_s7,
-                                                         fp[it + 1, ip1_s7][jm1_s7][km1_s7], exists_200_s7,
-                                                         fp[it + 1, ip1_s7][jm1_s7][k], exists_201_s7,
-                                                         fp[it + 1, ip1_s7][jm1_s7][kp1_s7], exists_202_s7,
-                                                         fp[it + 1, ip1_s7][j][km1_s7], exists_210_s7,
-                                                         fp[it + 1, ip1_s7][j][k], exists_211_s7,
-                                                         fp[it + 1, ip1_s7][j][kp1_s7], exists_212_s7,
-                                                         fp[it + 1, ip1_s7][jp1_s7][km1_s7], exists_220_s7,
-                                                         fp[it + 1, ip1_s7][jp1_s7][k], exists_221_s7,
-                                                         fp[it + 1, ip1_s7][jp1_s7][kp1_s7], exists_222_s7,
+                                                         fp_stable[it, im1_s7][jm1_s7][km1_s7], exists_000_s7,
+                                                         fp_stable[it, im1_s7][jm1_s7][k], exists_001_s7,
+                                                         fp_stable[it, im1_s7][jm1_s7][kp1_s7], exists_002_s7,
+                                                         fp_stable[it, im1_s7][j][km1_s7], exists_010_s7,
+                                                         fp_stable[it, im1_s7][j][k], exists_011_s7,
+                                                         fp_stable[it, im1_s7][j][kp1_s7], exists_012_s7,
+                                                         fp_stable[it, im1_s7][jp1_s7][km1_s7], exists_020_s7,
+                                                         fp_stable[it, im1_s7][jp1_s7][k], exists_021_s7,
+                                                         fp_stable[it, im1_s7][jp1_s7][kp1_s7], exists_022_s7,
+                                                         fp_stable[it, i][jm1_s7][km1_s7], exists_100_s7,
+                                                         fp_stable[it, i][jm1_s7][k], exists_101_s7,
+                                                         fp_stable[it, i][jm1_s7][kp1_s7], exists_102_s7,
+                                                         fp_stable[it, i][j][km1_s7], exists_110_s7,
+                                                         fp_stable[it, i][j][kp1_s7], exists_112_s7,
+                                                         fp_stable[it, i][jp1_s7][km1_s7], exists_120_s7,
+                                                         fp_stable[it, i][jp1_s7][k], exists_121_s7,
+                                                         fp_stable[it, i][jp1_s7][kp1_s7], exists_122_s7,
+                                                         fp_stable[it, ip1_s7][jm1_s7][km1_s7], exists_200_s7,
+                                                         fp_stable[it, ip1_s7][jm1_s7][k], exists_201_s7,
+                                                         fp_stable[it, ip1_s7][jm1_s7][kp1_s7], exists_202_s7,
+                                                         fp_stable[it, ip1_s7][j][km1_s7], exists_210_s7,
+                                                         fp_stable[it, ip1_s7][j][k], exists_211_s7,
+                                                         fp_stable[it, ip1_s7][j][kp1_s7], exists_212_s7,
+                                                         fp_stable[it, ip1_s7][jp1_s7][km1_s7], exists_220_s7,
+                                                         fp_stable[it, ip1_s7][jp1_s7][k], exists_221_s7,
+                                                         fp_stable[it, ip1_s7][jp1_s7][kp1_s7], exists_222_s7,
                                                        fp[it + 2, i][j][k])
                 it = it + 2
 
@@ -1241,21 +1100,22 @@ def pic3d_pysol():
                     for k in range(nfz):
                         add_sun_potential_k(hx, hy, hz, cx, cy, cz, sm, i, j, k, bn - 2, bm - 2, bl - 2,
                                             fp[it, i][j][k], fi[i][j][k])
-                        compute_force_k(hx, hy, hz, fi[i][j][k], fx[i][j][k], fy[i][j][k], fz[i][j][k])
+                        compute_force_k(hx, hy, hz, fi[i][j][k], fx[pv + 1, i][j][k], fy[pv + 1, i][j][k], fz[pv + 1, i][j][k])
 
-            n_particles : Type.Int = 0
-            ke : Type.Double = 0.0
             for i in range(nfx):
                 for j in range(nfy):
                     for k in range(nfz):
-                        count_particles_k(particles[pv + 2, i][j][k], n_particles)
-                        sum_kinetic_energy_k(particles[pv + 2, i][j][k], ke)
+                        particle_diag_k(particles[pv + 2, i][j][k],
+                                         n_particles_per_frag[0, i][j][k],
+                                         ke_per_frag[0, i][j][k])
+            n_particles : Type.Double = sum(n_particles_per_frag)
+            ke : Type.Double = sum(ke_per_frag)
             print_step_k(ts, n_particles, ke)
 
             for i in range(nfx):
                 for j in range(nfy):
                     for k in range(nfz):
-                        dump_density_k(ts, nts_dump, i, j, k, bn - 2, bm - 2, bl - 2, ro[i][j][k])
+                        dump_density_k(ts, nts_dump, i, j, k, bn - 2, bm - 2, bl - 2, ro[pv + 1, i][j][k])
 
             pv = pv + 2
 
@@ -1284,10 +1144,29 @@ def write_density_files():
     here as one animated .gif per projection instead (results/ro_sxy.gif,
     ro_sxz.gif, ro_syz.gif), since that's far easier to actually look at
     than a directory of individual frames.
+
+    In addition, for every dumped timestep this also writes the exact
+    file set pic3d_seq.cpp's own save_array_sxy/sxz/syz/cxy/cxz/cyz would
+    (see pic3d_common/common/mesh3d.h's mesh2d_log2d/mesh3d_log2d_xy/xz/yz):
+    results/ro.sxy.NNNNNN, ro.sxz.NNNNNN, ro.syz.NNNNNN (same sum-
+    projections as the GIF frames, just also dumped to disk one file per
+    step) and results/ro.cxy.NNNNNN, ro.cxz.NNNNNN, ro.cyz.NNNNNN (a single
+    slice through the plane that passes through the domain center
+    (cx,cy,cz), picked the same way the reference does via coord2cell -
+    here just an index lookup since the full merged array is already in
+    hand). Each is a flat, row-major float64 binary (nx*ny, nx*nz or
+    ny*nz doubles - gnuplot's own `binary array=(nx,ny) format="%lf"`
+    reads them directly, matching pic3d_common/sequential/gif.plt),
+    exactly like the reference's own files - this does NOT replace the
+    .raw/.bin/.gif pipeline above, which stays as pic3d_v2's own primary
+    (and easier to actually view) output.
     """
     import numpy as np
 
     nx, ny, nz = NFX * INTERIOR, NFY * INTERIOR, NFZ * INTERIOR
+    lx0 = int(round(CX / HX))
+    ly0 = int(round(CY / HY))
+    lz0 = int(round(CZ / HZ))
     frame_ts = []
     frames_sxy, frames_sxz, frames_syz = [], [], []
 
@@ -1316,9 +1195,29 @@ def write_density_files():
 
         arr = np.frombuffer(glob, dtype=np.float64).reshape(nx, ny, nz)
         frame_ts.append(ts)
-        frames_sxy.append(arr.sum(axis=2))  # sum over Z -> XY projection
-        frames_sxz.append(arr.sum(axis=1))  # sum over Y -> XZ projection
-        frames_syz.append(arr.sum(axis=0))  # sum over X -> YZ projection
+        sxy = arr.sum(axis=2)  # sum over Z -> XY projection
+        sxz = arr.sum(axis=1)  # sum over Y -> XZ projection
+        syz = arr.sum(axis=0)  # sum over X -> YZ projection
+        frames_sxy.append(sxy)
+        frames_sxz.append(sxz)
+        frames_syz.append(syz)
+
+        # pic3d_seq.cpp-matching file set (see the docstring above) -
+        # row-major float64, same (x*ny+y)/(x*nz+z)/(y*nz+z) flattening
+        # mesh2d_log2d/mesh3d_log2d_* use, which is numpy's default
+        # C-order flatten of these (nx,ny)/(nx,nz)/(ny,nz) arrays.
+        with open(f"results/ro.sxy.{ts:06d}", "wb") as out:
+            out.write(sxy.tobytes())
+        with open(f"results/ro.sxz.{ts:06d}", "wb") as out:
+            out.write(sxz.tobytes())
+        with open(f"results/ro.syz.{ts:06d}", "wb") as out:
+            out.write(syz.tobytes())
+        with open(f"results/ro.cxy.{ts:06d}", "wb") as out:
+            out.write(np.ascontiguousarray(arr[:, :, lz0]).tobytes())
+        with open(f"results/ro.cxz.{ts:06d}", "wb") as out:
+            out.write(np.ascontiguousarray(arr[:, ly0, :]).tobytes())
+        with open(f"results/ro.cyz.{ts:06d}", "wb") as out:
+            out.write(np.ascontiguousarray(arr[lx0, :, :]).tobytes())
 
     if not frame_ts:
         return
@@ -1360,18 +1259,20 @@ def make_density_gif(frames, frame_ts, out_path, xlabel, ylabel, summed_axis_lab
 
 
 if __name__ == "__main__":
-    # Run with OMP_NUM_THREADS=1 TBB_NUM_THREADS=1 (and ideally MKL_NUM_
-    # THREADS=1) - there is a confirmed sgc multithreading bug affecting
-    # cross-fragment GrowingArray reads through if-computed mailbox
-    # indices (see the module docstring's non-determinism note). Running
-    # single-threaded does not eliminate it entirely (a residual few-
-    # percent particle-count drift still shows up in the first handful of
-    # timesteps before it settles down), but it goes from losing ~70% of
-    # the particles to losing ~8-12%, and the resulting density field
-    # goes from visibly corrupted (a "hollow" disk) to a correctly filled
-    # one - see pic3d_v2/pic3d_common's own README/TODO for the matching,
-    # already-acknowledged "too fast particles" limitation on the
-    # reference's own side, which this is adjacent to but distinct from.
+    # Run with OMP_NUM_THREADS=1 at this file's full nfx=nfy=nfz=10/
+    # bn=bm=bl=42/np=1,000,996 scale - see the module docstring's updated
+    # non-determinism note (bug (2), NOT fixed): confirmed real particle-
+    # data corruption under multithreading at this scale specifically,
+    # concentrated in the z=cz fragment layer every particle starts in.
+    # Smaller configurations (this repo's own tests) were not observed to
+    # be affected by that one; bug (1) (a diagnostic-only accumulator
+    # race) IS fixed and no longer needs single-threading to work around.
+    # See pic3d_v2/pic3d_common's own README/TODO for the reference's
+    # own, separately-acknowledged "too fast particles" limitation
+    # (particles near the central singularity gaining enough velocity to
+    # skip more than one fragment per step) - this port's
+    # push_particles_block has its own CFL clamp specifically to avoid
+    # that, unrelated to either bug above.
     load_config("config.json")
 
     print("==========PIC3D_V2 (pysol, self-gravitating N-body)============")

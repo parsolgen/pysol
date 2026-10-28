@@ -4,6 +4,7 @@ from pysol.array import (
 )
 from pysol.decorator import (
     pysol, pysol_struct, pysol_compile, pysol_run, pysol_update_array,
+    pysol_update_array_3d_26_full_sum,
     NotSupportedLoop, NotSupportedIfStatement, NotImportedKernel,
     SolLibraryNotFoundError, SolFunctionNotFoundError, SolInitError, SolCompileError,
     UnsupportedVariableType, ArrayOperationError, UnsupportedCallError,
@@ -17,6 +18,7 @@ __all__ = [
     "Array", "ArrayElement", "GrowingArray", "CSRMatrix", "CSRBlock", "is_zero", "reset",
     "LATEST_VERSION",
     "pysol", "pysol_struct", "pysol_compile", "pysol_run", "pysol_update_array",
+    "pysol_update_array_3d_26_full_sum",
     "NotSupportedLoop", "NotSupportedIfStatement", "NotImportedKernel",
     "SolLibraryNotFoundError", "SolFunctionNotFoundError", "SolInitError", "SolCompileError",
     "UnsupportedVariableType", "ArrayOperationError", "UnsupportedCallError",

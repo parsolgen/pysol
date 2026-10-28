@@ -1,5 +1,5 @@
 {
     "sgc": "/home/usr/work/SolGenTest/build-rel/src/Parser/sgc",
     "compiler": "mpicxx",
-    "compile_options": "-std=c++23 -ftemplate-depth=8000 -DPSTL_USE_PARALLEL_POLICIES=0 -I/home/usr/software/goopax/include/goopax-6.0 -L/home/usr/software/goopax/lib64 -I/home/usr/intel/oneapi/tbb/2022.2/include/ -I/home/usr/software/intel/oneapi/mkl/latest/include -I/home/usr/work/SolGenTest/src/Runtime/ -I/home/usr/work/SolGenTest/src/ -L/home/usr/work/SolGenTest/build-rel/src/Runtime/CgGate -L/home/usr/software/intel/oneapi/mkl/latest/lib/intel64 -L/home/usr/intel/oneapi/tbb/2022.2/lib/intel64 -L/home/usr/software/gklib/lib -lPSRts -lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lGKlib -fopenmp -lgoopax -ltbb -O2"
+    "compile_options": "-std=c++23 -ftemplate-depth=8000 -DPSTL_USE_PARALLEL_POLICIES=0 -I/home/usr/software/goopax/include/goopax-6.0 -L/home/usr/software/goopax/lib64 -I/home/usr/intel/oneapi/tbb/2022.2/include/ -I/home/usr/software/intel/oneapi/mkl/latest/include -I/home/usr/work/SolGenTest/src/Runtime/ -I/home/usr/work/SolGenTest/src/ -L/home/usr/work/SolGenTest/build-rel/src/Runtime/CgGate -L/home/usr/software/intel/oneapi/mkl/latest/lib/intel64 -L/home/usr/intel/oneapi/tbb/2022.2/lib/intel64 -L/home/usr/software/gklib/lib -lPSRts -lmkl_intel_lp64 -lmkl_sequential -lmkl_core -lGKlib -fopenmp -lgoopax -ltbb -O3"
 }

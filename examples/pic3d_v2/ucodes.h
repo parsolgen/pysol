@@ -24,8 +24,10 @@
  * reaches):
  *   - "ro" (mass density): compute_density_raw_block scatters each
  *     fragment's own particles (trilinear/CIC, cell-centered) into a
- *     ghosted raw buffer; exchange_density_additive_block then does the
- *     reference's additive 26-neighbor merge (mesh3d_borders_sum_26_*).
+ *     ghosted raw buffer; pysol_update_array_3d_26_full_sum (the generic
+ *     runtime primitive - see exchange_3d_26_full_sum.sol - that replaced
+ *     this file's own exchange_density_additive_block kernel) then does
+ *     the reference's additive 26-neighbor merge (mesh3d_borders_sum_26_*).
  *   - "fp" (particle-sourced potential): poisson_jacobi_sweep_block does
  *     one weighted-Jacobi sweep (plain Jacobi, w=1 in the reference's own
  *     default pic3d.par - no SOR/Gauss-Seidel approximation needed here,
@@ -74,6 +76,8 @@
 #include <cstdio>
 #include <type_traits>
 #include <vector>
+#include <mutex>
+#include <unordered_set>
 
 inline int flat3(int i, int j, int k, int m, int l)
 {
@@ -91,8 +95,17 @@ void zero_block3d(int n, int m, int l, double* a)
 	for (int i = 0; i < n * m * l; ++i) a[i] = 0.0;
 }
 
-void copy_block3d(int n, int m, int l, const double* a, double* b)
+// Each n_dims=3 KernelArgument (a, b) carries its own leading n1/n2/n3
+// block-size triple ahead of its pointer (see
+// pysol.sol_generator._gen_import_arg_decl), on top of this kernel's own
+// explicit n/m/l - a and b are always equal-shaped blocks here, so only
+// n/m/l is actually used; a_n1..b_n3 are unused but must still be present
+// in the signature to match what sgc generates for the call.
+void copy_block3d(int n, int m, int l,
+                   int a_n1, int a_n2, int a_n3, const double* a,
+                   int b_n1, int b_n2, int b_n3, double* b)
 {
+	(void)a_n1; (void)a_n2; (void)a_n3; (void)b_n1; (void)b_n2; (void)b_n3;
 	for (int i = 0; i < n * m * l; ++i) b[i] = a[i];
 }
 
@@ -103,7 +116,7 @@ void copy_block3d(int n, int m, int l, const double* a, double* b)
  * den_raw has a 1-cell ghost per side (dn = bn+2, etc, where bn is this
  * fragment's own interior cell count per axis); any particle's trilinear
  * footprint that spills past the fragment's own interior lands in that
- * ghost margin, for exchange_density_additive_block to pick up.
+ * ghost margin, for pysol_update_array_3d_26_full_sum to pick up.
  *=========================================================================*/
 template <typename ElementT>
 void compute_density_raw_block(double hx, double hy, double hz, double am,
@@ -126,9 +139,22 @@ void compute_density_raw_block(double hx, double hy, double hz, double am,
 		int li = gi - ii * bn + 1;
 		int lj = gj - jj * bm + 1;
 		int lk = gk - kk * bl + 1;
-		if (li < 1) li = 1; else if (li > bn) li = bn;
-		if (lj < 1) lj = 1; else if (lj > bm) lj = bm;
-		if (lk < 1) lk = 1; else if (lk > bl) lk = bl;
+		// Legitimate range is [0, bn] (li=0/bn+1 are this fragment's own
+		// 1-cell ghost margin - see the function comment): the -0.5
+		// cell-center shift above means a particle push_particles_block
+		// routed into this fragment by its physical box position can still
+		// floor() to one cell below/above the interior, and that spill
+		// MUST land in the ghost margin for pysol_update_array_3d_26_full_sum
+		// to fold it into the real neighbor cell. Clamping li's low end to 1
+		// instead of 0 was forcing that spill into this fragment's own
+		// interior boundary cell - double-counting it there while starving
+		// the neighbor - which showed up as a fragment-grid artifact in the
+		// dumped density. Only clamp against genuine floating-point outliers
+		// (more than one cell out), which should never happen given a
+		// correctly-routed particle.
+		if (li < 0) li = 0; else if (li > bn) li = bn;
+		if (lj < 0) lj = 0; else if (lj > bm) lj = bm;
+		if (lk < 0) lk = 0; else if (lk > bl) lk = bl;
 
 		double v = scale;
 		den_raw[flat3(li,     lj,     lk,     dm, dl)] += v * (1 - di) * (1 - dj) * (1 - dk);
@@ -142,217 +168,12 @@ void compute_density_raw_block(double hx, double hy, double hz, double am,
 	}
 }
 
-/*=========================================================================
- * exchange_density_additive_block: the reference's borders_exchange_sum_26
- * (mesh3d_borders_sum_26_get/_set), done directly fragment-to-fragment
- * instead of via an intermediate send/receive buffer - every one of the
- * 26 neighbor overlap regions is independently ADDED (not just copied):
- * a node physically shared by several fragments (2 across a face, 4 along
- * an edge, 8 at a corner) must sum every one of their independent raw
- * scatters, which is exactly what looping over all 26 directions
- * (self-raw baseline + up to 26 overlapping neighbor regions) achieves,
- * even though the write ranges below overlap each other on purpose.
- *=========================================================================*/
-void exchange_density_additive_block(
-				int sn, int sm, int sl, const double* self_raw,
-				int n000, int m000, int l000, const double* nbr000, int exists000,
-				int n001, int m001, int l001, const double* nbr001, int exists001,
-				int n002, int m002, int l002, const double* nbr002, int exists002,
-				int n010, int m010, int l010, const double* nbr010, int exists010,
-				int n011, int m011, int l011, const double* nbr011, int exists011,
-				int n012, int m012, int l012, const double* nbr012, int exists012,
-				int n020, int m020, int l020, const double* nbr020, int exists020,
-				int n021, int m021, int l021, const double* nbr021, int exists021,
-				int n022, int m022, int l022, const double* nbr022, int exists022,
-				int n100, int m100, int l100, const double* nbr100, int exists100,
-				int n101, int m101, int l101, const double* nbr101, int exists101,
-				int n102, int m102, int l102, const double* nbr102, int exists102,
-				int n110, int m110, int l110, const double* nbr110, int exists110,
-				int n112, int m112, int l112, const double* nbr112, int exists112,
-				int n120, int m120, int l120, const double* nbr120, int exists120,
-				int n121, int m121, int l121, const double* nbr121, int exists121,
-				int n122, int m122, int l122, const double* nbr122, int exists122,
-				int n200, int m200, int l200, const double* nbr200, int exists200,
-				int n201, int m201, int l201, const double* nbr201, int exists201,
-				int n202, int m202, int l202, const double* nbr202, int exists202,
-				int n210, int m210, int l210, const double* nbr210, int exists210,
-				int n211, int m211, int l211, const double* nbr211, int exists211,
-				int n212, int m212, int l212, const double* nbr212, int exists212,
-				int n220, int m220, int l220, const double* nbr220, int exists220,
-				int n221, int m221, int l221, const double* nbr221, int exists221,
-				int n222, int m222, int l222, const double* nbr222, int exists222,
-				int n, int m, int l, double* out)
-{
-	(void)sn; (void)sm; (void)sl;
-	(void)n000; (void)m000; (void)l000; (void)n001; (void)m001; (void)l001; (void)n002; (void)m002; (void)l002;
-	(void)n010; (void)m010; (void)l010; (void)n011; (void)m011; (void)l011; (void)n012; (void)m012; (void)l012;
-	(void)n020; (void)m020; (void)l020; (void)n021; (void)m021; (void)l021; (void)n022; (void)m022; (void)l022;
-	(void)n100; (void)m100; (void)l100; (void)n101; (void)m101; (void)l101; (void)n102; (void)m102; (void)l102;
-	(void)n110; (void)m110; (void)l110; (void)n112; (void)m112; (void)l112;
-	(void)n120; (void)m120; (void)l120; (void)n121; (void)m121; (void)l121; (void)n122; (void)m122; (void)l122;
-	(void)n200; (void)m200; (void)l200; (void)n201; (void)m201; (void)l201; (void)n202; (void)m202; (void)l202;
-	(void)n210; (void)m210; (void)l210; (void)n211; (void)m211; (void)l211; (void)n212; (void)m212; (void)l212;
-	(void)n220; (void)m220; (void)l220; (void)n221; (void)m221; (void)l221; (void)n222; (void)m222; (void)l222;
-
-	for (int i = 0; i < n * m * l; ++i) out[i] = self_raw[i];
-
-	if (exists000) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr000[flat3(li+(n-2),lj+(m-2),lk+(l-2),m,l)];
-	}
-	if (exists001) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr001[flat3(li+(n-2),lj+(m-2),lk,m,l)];
-	}
-	if (exists002) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr002[flat3(li+(n-2),lj+(m-2),lk-(l-2),m,l)];
-	}
-	if (exists010) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr010[flat3(li+(n-2),lj,lk+(l-2),m,l)];
-	}
-	if (exists011) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr011[flat3(li+(n-2),lj,lk,m,l)];
-	}
-	if (exists012) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr012[flat3(li+(n-2),lj,lk-(l-2),m,l)];
-	}
-	if (exists020) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr020[flat3(li+(n-2),lj-(m-2),lk+(l-2),m,l)];
-	}
-	if (exists021) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr021[flat3(li+(n-2),lj-(m-2),lk,m,l)];
-	}
-	if (exists022) {
-		for (int li = 0; li <= 1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr022[flat3(li+(n-2),lj-(m-2),lk-(l-2),m,l)];
-	}
-	if (exists100) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr100[flat3(li,lj+(m-2),lk+(l-2),m,l)];
-	}
-	if (exists101) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr101[flat3(li,lj+(m-2),lk,m,l)];
-	}
-	if (exists102) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr102[flat3(li,lj+(m-2),lk-(l-2),m,l)];
-	}
-	if (exists110) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr110[flat3(li,lj,lk+(l-2),m,l)];
-	}
-	if (exists112) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr112[flat3(li,lj,lk-(l-2),m,l)];
-	}
-	if (exists120) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr120[flat3(li,lj-(m-2),lk+(l-2),m,l)];
-	}
-	if (exists121) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr121[flat3(li,lj-(m-2),lk,m,l)];
-	}
-	if (exists122) {
-		for (int li = 0; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr122[flat3(li,lj-(m-2),lk-(l-2),m,l)];
-	}
-	if (exists200) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr200[flat3(li-(n-2),lj+(m-2),lk+(l-2),m,l)];
-	}
-	if (exists201) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr201[flat3(li-(n-2),lj+(m-2),lk,m,l)];
-	}
-	if (exists202) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= 1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr202[flat3(li-(n-2),lj+(m-2),lk-(l-2),m,l)];
-	}
-	if (exists210) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr210[flat3(li-(n-2),lj,lk+(l-2),m,l)];
-	}
-	if (exists211) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr211[flat3(li-(n-2),lj,lk,m,l)];
-	}
-	if (exists212) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = 0; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr212[flat3(li-(n-2),lj,lk-(l-2),m,l)];
-	}
-	if (exists220) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= 1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr220[flat3(li-(n-2),lj-(m-2),lk+(l-2),m,l)];
-	}
-	if (exists221) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = 0; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr221[flat3(li-(n-2),lj-(m-2),lk,m,l)];
-	}
-	if (exists222) {
-		for (int li = n-2; li <= n-1; ++li)
-		for (int lj = m-2; lj <= m-1; ++lj)
-		for (int lk = l-2; lk <= l-1; ++lk)
-			out[flat3(li,lj,lk,m,l)] += nbr222[flat3(li-(n-2),lj-(m-2),lk-(l-2),m,l)];
-	}
-}
+// exchange_density_additive_block has moved into the runtime itself as
+// the generic 26-neighbor additive exchange kernel pair
+// _read_ghost_26_full_sum_<type>/_write_ghost_26_full_sum_<type> (see
+// SolGenTest's src/Runtime/CgGate/rts.cpp), used here through pysol's
+// pysol_update_array_3d_26_full_sum(ro_raw, 0, ro, 0) - see
+// exchange_3d_26_full_sum.sol.
 
 /*=========================================================================
  * exchange_potential_copy_block: the reference's borders_exchange_26
@@ -788,6 +609,9 @@ void gather_force(double px, double py, double pz, double hx, double hy, double 
 // reproduces the reference's combined direction code exactly, so a
 // particle that crosses two or three faces in the same step (a diagonal
 // move) is still routed correctly in a single hop.
+
+std::unordered_set<std::size_t> used_ptrs;
+
 template <typename ElementTIn, typename ElementTOut>
 void push_particles_block(double tau, double xn, double yn, double zn,
                            double hx, double hy, double hz,
@@ -960,23 +784,40 @@ void merge_particles_block(
  * module docstring) and output
  *=========================================================================*/
 
+// RACE-FREE per-fragment diagnostic: writes this fragment's own particle
+// count + kinetic energy into its own distinct cell of a plain (non-
+// growing) Array - ordinary single-writer-per-element Array semantics,
+// the same guarantee ro/fp's exchanges already rely on. The actual
+// whole-domain total is then a sgc-level sum() reduction over that Array
+// (see pic3d.py), not a hand-rolled accumulator.
+//
+// This replaces a prior count_particles_k/sum_kinetic_energy_k pair that
+// wrote into one SHARED scalar via += across all nfx*nfy*nfz kernel calls
+// in a timestep - confirmed by direct empirical testing (repeated runs at
+// up to 20 OMP threads, cross-checked against independently-dumped per-
+// fragment particle data) to lose updates under concurrency: the printed
+// n_particles/KE diagnostic would occasionally read low while the actual
+// particle data was always intact. That was the only place in this file
+// using that pattern; the actual particle migration (push_particles_block/
+// merge_particles_block below) was NOT reproducibly racy under the same
+// testing, at scales up to 1000 fragments / ~282,000 particles / 10-20
+// threads - see pic3d.py's module docstring for the current, narrower
+// state of the known-limitations note.
 template <typename ElementT>
-void count_particles_k(const ElementT* cell, int& count)
+void particle_diag_block(const ElementT* cell,
+                          int cn, int cm, int cl, double* count_out,
+                          int kn, int km, int kl, double* ke_out)
 {
-	count += (int)cell->data_.size();
-}
-
-template <typename ElementT>
-void sum_kinetic_energy_k(const ElementT* cell, double& ke_sum)
-{
+	double n = (double)cell->data_.size();
 	double s = 0.0;
 	for (const auto& p : cell->data_) s += p.u * p.u + p.v * p.v + p.w * p.w;
-	ke_sum += s;
+	count_out[0] = n;
+	ke_out[0] = s;
 }
 
-void print_step(int ts, int n_particles, double ke)
+void print_step(int ts, double n_particles, double ke)
 {
-	std::printf("ts=%d n_particles=%d KE=%.6le\n", ts, n_particles, ke);
+	std::printf("ts=%d n_particles=%.0lf KE=%.6le\n", ts, n_particles, ke);
 	std::fflush(stdout);
 }
 

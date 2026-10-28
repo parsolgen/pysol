@@ -851,3 +851,18 @@ def pysol_update_array(
     destination_version: int,
 ) -> None:
     pass
+
+
+def pysol_update_array_3d_26_full_sum(
+    source: Array,
+    source_version: int,
+    destination: Array,
+    destination_version: int,
+) -> None:
+    """26-neighbor additive halo exchange for an n_dims=3 Array - see
+    exchange_3d_26_full_sum.sol. Generalizes examples/pic3d_v2's
+    exchange_density_additive_block: every block's data overlaps its
+    neighbors' by a 2-cell-wide slab on each face/edge/corner, and the
+    correct destination value there is the SUM of every overlapping
+    block's contribution, not a copy from one of them."""
+    pass

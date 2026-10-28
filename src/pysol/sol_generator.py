@@ -10,6 +10,9 @@ _AST_INDEX = getattr(ast, "Index", None)
 
 _EXCHANGE_PATTERN = os.path.join(os.path.dirname(__file__), "exchange.sol")
 _EXCHANGE_PATTERN_3D = os.path.join(os.path.dirname(__file__), "exchange_3d.sol")
+_EXCHANGE_PATTERN_3D_26_FULL_SUM = os.path.join(
+    os.path.dirname(__file__), "exchange_3d_26_full_sum.sol"
+)
 
 from pysol.decorator import (
     ArrayOperationError,
@@ -511,6 +514,11 @@ class _SolWriter:
             call = node.value
             if _unparse(call.func) in ("pysol_update_array", "pysol.pysol_update_array"):
                 return self._update_array_stmt(call, ind)
+            if _unparse(call.func) in (
+                "pysol_update_array_3d_26_full_sum",
+                "pysol.pysol_update_array_3d_26_full_sum",
+            ):
+                return self._update_array_3d_26_full_sum_stmt(call, ind)
             if _is_reset_call(call):
                 return [ind + self._reset_stmt(call)]
             return [ind + self._call_stmt(call) + ";"]
@@ -621,6 +629,68 @@ class _SolWriter:
         self._update_array_call_count += 1
         expanded, hoisted, imports = _pysol_apply_pattern(
             pattern_str, pattern_file, self._update_array_call_count, array_types
+        )
+        self._pending_hoists.append(([src_arg.id, dst_arg.id], hoisted))
+        for imp in imports:
+            if imp not in self._seen_imports:
+                self._seen_imports.add(imp)
+                self._hoist_imports.append(imp)
+        return [ind + line for line in expanded.splitlines()]
+
+    def _update_array_3d_26_full_sum_stmt(self, call: ast.Call, ind: str) -> List[str]:
+        """Handle pysol_update_array_3d_26_full_sum(source, source_version,
+        destination, destination_version) - the 26-neighbor additive halo
+        exchange for n_dims=3 arrays (see exchange_3d_26_full_sum.sol)."""
+        if len(call.args) != 4:
+            raise UnsupportedCallError(
+                "pysol_update_array_3d_26_full_sum expects 4 positional arguments: "
+                "source, source_version, destination, destination_version"
+            )
+        src_arg, src_ver_arg, dst_arg, dst_ver_arg = call.args
+
+        if not isinstance(src_arg, ast.Name) or src_arg.id not in self._arrays:
+            raise UnsupportedCallError(
+                "pysol_update_array_3d_26_full_sum: argument 1 (source) must be a "
+                "known array variable"
+            )
+        if not isinstance(dst_arg, ast.Name) or dst_arg.id not in self._arrays:
+            raise UnsupportedCallError(
+                "pysol_update_array_3d_26_full_sum: argument 3 (destination) must be "
+                "a known array variable"
+            )
+
+        src_info = self._arrays[src_arg.id]
+        dst_info = self._arrays[dst_arg.id]
+
+        if src_info.n_dims != "3":
+            raise UnsupportedCallError(
+                f"pysol_update_array_3d_26_full_sum: source array '{src_arg.id}' must "
+                f"have n_dims=3, got n_dims={src_info.n_dims}"
+            )
+        if dst_info.n_dims != "3":
+            raise UnsupportedCallError(
+                f"pysol_update_array_3d_26_full_sum: destination array '{dst_arg.id}' "
+                f"must have n_dims=3, got n_dims={dst_info.n_dims}"
+            )
+
+        _validate_array_operands(src_info, dst_info)
+
+        src_ver = self._expr(src_ver_arg)
+        dst_ver = self._expr(dst_ver_arg)
+        pattern_str = (
+            f"pysol_update_array_3d_26_full_sum({src_arg.id}, {src_ver}, "
+            f"{dst_arg.id}, {dst_ver})"
+        )
+        array_types = {
+            name: _SOL_TYPE.get(info.elem_type, info.elem_type)
+            for name, info in self._arrays.items()
+        }
+        self._update_array_call_count += 1
+        expanded, hoisted, imports = _pysol_apply_pattern(
+            pattern_str,
+            _EXCHANGE_PATTERN_3D_26_FULL_SUM,
+            self._update_array_call_count,
+            array_types,
         )
         self._pending_hoists.append(([src_arg.id, dst_arg.id], hoisted))
         for imp in imports:
