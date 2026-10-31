@@ -1,26 +1,21 @@
-"""Live velocity-field visualizer for lattice_gas.py.
+"""Live velocity-field visualizer for lattice_gas.py - plain pygame +
+sockets (same libraries as examples/pic3d_v2/live_vis.py), no matplotlib.
 
-Run this first, then run lattice_gas.py (in the same process or on a
-different machine) with:
+Run this first, then run lattice_gas.py with:
 
     LATTICE_GAS_VIZ_ENABLE=1 python3 lattice_gas.py
 
-lattice_gas.py's send_velocity_block kernel (see its long comment in
-ucodes.h) connects to this script over a plain TCP socket and streams
-each block's velocity (ux, uy) the instant it's computed; this script
-redraws immediately on every block it receives, rather than waiting for
-the run to finish or for a full timestep's worth of blocks to arrive -
-"live" meaning exactly that: watch the lid-driven flow develop while the
-simulation is still running.
+lattice_gas.py's send_velocity_block kernel (see ucodes.h) opens ONE
+persistent connection for the whole run and streams every block's
+velocity (ux, uy) over it the instant it's computed. This script keeps
+a shared ux/uy grid updated from that stream on a background thread,
+and redraws from whatever's currently in it on a plain 30fps loop - the
+flow is visibly developing while the simulation is still running.
 
-IP address and port are both set on the COMMAND LINE here (--host/--port
-default to 0.0.0.0:8765, i.e. listen on every interface) and via
-environment variables on the simulation side (LATTICE_GAS_VIZ_HOST/
-LATTICE_GAS_VIZ_PORT, default 127.0.0.1:8765) - change whichever side's
-default doesn't fit (e.g. point LATTICE_GAS_VIZ_HOST at this machine's
-real address if lattice_gas.py is running elsewhere on the network; this
-script's --host only controls which local interface it listens on, not
-where connections may come from).
+Usage:
+    python3 visualizer.py [port]        # default 8765, matches
+                                         # lattice_gas.py's
+                                         # LATTICE_GAS_VIZ_PORT default
 
 Wire format (must stay in sync with send_velocity_block in ucodes.h):
     header   = 4 bytes b"LGVP" + 7x little-endian int32:
@@ -28,190 +23,148 @@ Wire format (must stay in sync with send_velocity_block in ucodes.h):
     payload  = bn*bm little-endian float64 (ux block, row-major [li][lj])
              + bn*bm little-endian float64 (uy block, same layout)
 """
-
-import argparse
 import socket
 import struct
 import sys
+import threading
+
+import numpy as np
+import pygame
+
+HOST = "0.0.0.0"
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
 
 HEADER_FORMAT = "<4siiiiiii"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 MAGIC = b"LGVP"
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", default="0.0.0.0",
-                         help="local interface to listen on (default: 0.0.0.0, all interfaces)")
-    parser.add_argument("--port", type=int, default=8765,
-                         help="TCP port to listen on (default: 8765, matches "
-                              "lattice_gas.py's LATTICE_GAS_VIZ_PORT default)")
-    parser.add_argument("--save-frames", metavar="DIR", default=None,
-                         help="instead of an interactive window, save each received "
-                              "frame as a PNG into DIR (headless-safe - useful for "
-                              "testing without a display, or for building an "
-                              "animation afterward)")
-    return parser.parse_args()
+# Global ux/uy grids - (re)allocated lazily from the first header's
+# (gnx, gny), or reallocated if a later one reports a different size
+# (a fresh simulation run may use different parameters than the last).
+# Stored as (gny, gnx), matching the wire layout's [jj][ii] block tiling;
+# transposed to pygame's (x, y) order only at render time.
+ux_grid = None
+uy_grid = None
+grid_lock = threading.Lock()
 
 
-def recv_exact(conn, n, on_idle):
-    """Reads exactly n bytes, calling on_idle() (which processes GUI
-    events and yields briefly) instead of blocking the whole process
-    whenever the socket has nothing ready yet - this is what keeps the
-    plot window responsive (resizable, closable) while waiting between
-    blocks, not just while new data is actively arriving."""
-    buf = bytearray()
-    while len(buf) < n:
-        try:
-            chunk = conn.recv(n - len(buf))
-        except socket.timeout:
-            on_idle()
-            continue
+def recv_exact(conn, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
         if not chunk:
             return None
-        buf.extend(chunk)
-    return bytes(buf)
+        data.extend(chunk)
+    return bytes(data)
 
 
-class FieldDisplay:
-    """Owns the full-grid ux/uy arrays and the two live subplots, both
-    (re)allocated lazily from the first header's (gnx, gny) - or
-    reallocated if a later connection reports a different grid size,
-    since each TCP connection is a fresh simulation run that may use
-    different parameters than the last."""
+# Diverging blue -> white -> red map (same idea as the original
+# matplotlib "RdBu_r"), scaled symmetrically around zero by this
+# field's own current largest magnitude.
+NEG = np.array([30, 60, 200], dtype=np.float32)
+MID = np.array([245, 245, 245], dtype=np.float32)
+POS = np.array([200, 30, 30], dtype=np.float32)
 
-    def __init__(self, plt, np, save_dir):
-        self.plt = plt
-        self.np = np
-        self.save_dir = save_dir
-        self.gnx = None
-        self.gny = None
-        self.ux = None
-        self.uy = None
-        self.fig = None
-        self.ax_ux = None
-        self.ax_uy = None
-        self.im_ux = None
-        self.im_uy = None
-        self.frame_count = 0
 
-    def _allocate(self, gnx, gny):
-        np = self.np
-        self.gnx, self.gny = gnx, gny
-        self.ux = np.zeros((gny, gnx), dtype=np.float64)
-        self.uy = np.zeros((gny, gnx), dtype=np.float64)
+def velocity_to_rgb(values):
+    vmax = max(float(np.max(np.abs(values))), 1e-12)
+    t = np.clip(values / vmax, -1, 1)
+    neg_t = np.clip(-t, 0, 1)[..., None]
+    pos_t = np.clip(t, 0, 1)[..., None]
+    rgb = MID + neg_t * (NEG - MID) + pos_t * (POS - MID)
+    return rgb.astype(np.uint8)
 
-        if self.fig is not None:
-            self.plt.close(self.fig)
-        self.fig, (self.ax_ux, self.ax_uy) = self.plt.subplots(1, 2, figsize=(14, 4))
-        self.im_ux = self.ax_ux.imshow(self.ux, origin="lower", cmap="RdBu_r", aspect="auto")
-        self.im_uy = self.ax_uy.imshow(self.uy, origin="lower", cmap="RdBu_r", aspect="auto")
-        self.ax_ux.set_title("ux")
-        self.ax_uy.set_title("uy")
-        self.fig.colorbar(self.im_ux, ax=self.ax_ux)
-        self.fig.colorbar(self.im_uy, ax=self.ax_uy)
-        self.fig.tight_layout()
-        if self.save_dir is None:
-            self.plt.show(block=False)
 
-    def update(self, step, ii, jj, bn, bm, gnx, gny, ux_block, uy_block):
-        np = self.np
-        if gnx != self.gnx or gny != self.gny:
-            self._allocate(gnx, gny)
+def process_connection(conn):
+    global ux_grid, uy_grid
+    print(f"visualizer.py: connected from {conn.getpeername()}")
+    try:
+        while True:
+            header = recv_exact(conn, HEADER_SIZE)
+            if header is None:
+                print("visualizer.py: sender disconnected, waiting for a new connection...")
+                return
+            magic, step, ii, jj, bn, bm, gnx, gny = struct.unpack(HEADER_FORMAT, header)
+            if magic != MAGIC:
+                print("visualizer.py: bad magic bytes, dropping this connection")
+                return
 
-        self.ux[jj * bm:(jj + 1) * bm, ii * bn:(ii + 1) * bn] = ux_block.T
-        self.uy[jj * bm:(jj + 1) * bm, ii * bn:(ii + 1) * bn] = uy_block.T
+            count = bn * bm
+            payload = recv_exact(conn, count * 8 * 2)
+            if payload is None:
+                print("visualizer.py: sender disconnected mid-block")
+                return
 
-        self.im_ux.set_data(self.ux)
-        self.im_uy.set_data(self.uy)
-        for im, field in ((self.im_ux, self.ux), (self.im_uy, self.uy)):
-            lo, hi = float(field.min()), float(field.max())
-            if lo == hi:
-                lo, hi = lo - 1e-9, hi + 1e-9
-            im.set_clim(lo, hi)
+            ux_block = np.frombuffer(payload, dtype="<f8", count=count).reshape(bn, bm)
+            uy_block = np.frombuffer(payload, dtype="<f8", count=count, offset=count * 8).reshape(bn, bm)
 
-        self.fig.suptitle(f"step={step}  block=({ii},{jj})")
+            with grid_lock:
+                if ux_grid is None or ux_grid.shape != (gny, gnx):
+                    ux_grid = np.zeros((gny, gnx), dtype=np.float64)
+                    uy_grid = np.zeros((gny, gnx), dtype=np.float64)
+                ux_grid[jj * bm:(jj + 1) * bm, ii * bn:(ii + 1) * bn] = ux_block.T
+                uy_grid[jj * bm:(jj + 1) * bm, ii * bn:(ii + 1) * bn] = uy_block.T
+    finally:
+        conn.close()
 
-        if self.save_dir is not None:
-            import os
-            os.makedirs(self.save_dir, exist_ok=True)
-            self.frame_count += 1
-            path = os.path.join(self.save_dir, f"frame_{self.frame_count:06d}.png")
-            self.fig.savefig(path)
-        else:
-            self.fig.canvas.draw_idle()
-            self.plt.pause(0.001)
 
-    def idle(self):
-        if self.fig is not None and self.save_dir is None:
-            self.plt.pause(0.01)
-        elif self.save_dir is None:
-            # No figure yet (nothing received this connection); still
-            # need SOMETHING to keep any already-open window from an
-            # earlier connection responsive.
-            try:
-                self.plt.pause(0.01)
-            except Exception:
-                pass
+def network_thread():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen()
+    print(f"Listening on {HOST}:{PORT}")
+
+    while True:
+        conn, _ = server.accept()
+        process_connection(conn)  # one sender (one persistent connection) at a time
+
+
+def render_scaled(screen, image, dest_rect):
+    """image is (x, y, 3); dest_rect is (x0, y0, w, h) within screen."""
+    x0, y0, w, h = dest_rect
+    img_w, img_h = image.shape[:2]
+
+    scale = min(w / img_w, h / img_h)
+    draw_w, draw_h = int(img_w * scale), int(img_h * scale)
+    x, y = x0 + (w - draw_w) // 2, y0 + (h - draw_h) // 2
+
+    surface = pygame.surfarray.make_surface(image)
+    scaled = pygame.transform.smoothscale(surface, (draw_w, draw_h))
+    screen.blit(scaled, (x, y))
 
 
 def main():
-    args = parse_args()
+    threading.Thread(target=network_thread, daemon=True).start()
 
-    if args.save_frames is not None:
-        import matplotlib
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
+    pygame.init()
+    screen = pygame.display.set_mode((1000, 500), pygame.RESIZABLE)
+    pygame.display.set_caption("lattice_gas live velocity (ux | uy)")
+    clock = pygame.time.Clock()
 
-    if args.save_frames is None:
-        plt.ion()
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.VIDEORESIZE:
+                screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
 
-    display = FieldDisplay(plt, np, args.save_frames)
+        with grid_lock:
+            ux = None if ux_grid is None else ux_grid.copy()
+            uy = None if uy_grid is None else uy_grid.copy()
 
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind((args.host, args.port))
-    listener.listen(1)
-    print(f"visualizer.py: listening on {args.host}:{args.port} "
-          f"- waiting for lattice_gas.py to connect...", file=sys.stderr)
+        screen.fill((0, 0, 0))
+        if ux is not None:
+            win_w, win_h = screen.get_size()
+            half_w = win_w // 2
+            render_scaled(screen, velocity_to_rgb(ux).transpose(1, 0, 2), (0, 0, half_w, win_h))
+            render_scaled(screen, velocity_to_rgb(uy).transpose(1, 0, 2), (half_w, 0, win_w - half_w, win_h))
 
-    try:
-        while True:
-            conn, addr = listener.accept()
-            print(f"visualizer.py: connected from {addr}", file=sys.stderr)
-            conn.settimeout(0.05)
-            try:
-                while True:
-                    header_bytes = recv_exact(conn, HEADER_SIZE, display.idle)
-                    if header_bytes is None:
-                        print("visualizer.py: sender disconnected, waiting for a new connection...",
-                              file=sys.stderr)
-                        break
+        pygame.display.flip()
+        clock.tick(30)
 
-                    magic, step, ii, jj, bn, bm, gnx, gny = struct.unpack(HEADER_FORMAT, header_bytes)
-                    if magic != MAGIC:
-                        print("visualizer.py: bad magic bytes, dropping this connection", file=sys.stderr)
-                        break
-
-                    payload_size = bn * bm * 8 * 2
-                    payload = recv_exact(conn, payload_size, display.idle)
-                    if payload is None:
-                        print("visualizer.py: sender disconnected mid-block, waiting for a new connection...",
-                              file=sys.stderr)
-                        break
-
-                    block_doubles = bn * bm
-                    ux_block = np.frombuffer(payload, dtype="<f8", count=block_doubles).reshape(bn, bm)
-                    uy_block = np.frombuffer(payload, dtype="<f8", count=block_doubles,
-                                              offset=block_doubles * 8).reshape(bn, bm)
-
-                    display.update(step, ii, jj, bn, bm, gnx, gny, ux_block, uy_block)
-            finally:
-                conn.close()
-    except KeyboardInterrupt:
-        print("\nvisualizer.py: stopped.", file=sys.stderr)
+    pygame.quit()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from pysol import (
 NFX, NFY, NFZ = 10, 10, 10
 INTERIOR = 40
 BN, BM, BL = INTERIOR + 2, INTERIOR + 2, INTERIOR + 2
-NUM_TS = 100
+NUM_TS = 1000
 NTS_DUMP = 5
 # Domain center/spacing mirrors (cx,cy,cz,hx,hy,hz above), needed to locate
 # the center-plane slice index for the ro.cxy/cxz/cyz.NNNNNN files below.
@@ -421,6 +421,23 @@ def pic3d_pysol():
                                     KernelArgument("bl", True, Type.Int),
                                     KernelArgument("ro", True, Type.Double, 3)])
 
+    # Optional live visualization (see live_vis.py + send_density_xy_block
+    # in ucodes.h): a no-op unless PYSOL_VIS_PORT is set in the
+    # environment, in which case every fragment streams its own
+    # sum-over-z XY tile to a separate viewer process once per timestep.
+    send_density_xy_k = import_kernel("send_density_xy_block",
+                                      [KernelArgument("ts", True, Type.Int),
+                                       KernelArgument("ii", True, Type.Int),
+                                       KernelArgument("jj", True, Type.Int),
+                                       KernelArgument("kk", True, Type.Int),
+                                       KernelArgument("nfx", True, Type.Int),
+                                       KernelArgument("nfy", True, Type.Int),
+                                       KernelArgument("nfz", True, Type.Int),
+                                       KernelArgument("bn", True, Type.Int),
+                                       KernelArgument("bm", True, Type.Int),
+                                       KernelArgument("bl", True, Type.Int),
+                                       KernelArgument("ro", True, Type.Double, 3)])
+
     # -- mesh / fragment grid / physics parameters: matches pic3d_common/
     # common/pic3d.par (the file pic3d_seq.cpp itself reads) exactly for
     # every domain/physics value that has no runnability cost (xn=yn=zn=1.0,
@@ -495,10 +512,11 @@ def pic3d_pysol():
     # here only because pm is a variable reference, not a second literal.
     am : Type.Double = pm / 1000996.0
 
-    tau : Type.Double = 0.0001
+    #tau : Type.Double = 0.0001
+    tau : Type.Double = 0.0000001
     w_relax : Type.Double = 1.0
 
-    num_ts : Type.Int = 100
+    num_ts : Type.Int = 1000
     nts_dump : Type.Int = 5
     max_jacobi_iters : Type.Int = 80
 
@@ -1115,7 +1133,7 @@ def pic3d_pysol():
             for i in range(nfx):
                 for j in range(nfy):
                     for k in range(nfz):
-                        dump_density_k(ts, nts_dump, i, j, k, bn - 2, bm - 2, bl - 2, ro[pv + 1, i][j][k])
+                        send_density_xy_k(ts, i, j, k, nfx, nfy, nfz, bn - 2, bm - 2, bl - 2, ro[pv + 1, i][j][k])
 
             pv = pv + 2
 

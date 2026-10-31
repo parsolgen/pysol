@@ -74,10 +74,16 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
-#include <mutex>
 #include <unordered_set>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 inline int flat3(int i, int j, int k, int m, int l)
 {
@@ -848,4 +854,99 @@ void dump_density_block(int ts, int nts_dump, int ii, int jj, int kk, int bn, in
 		std::fwrite(&v, sizeof(double), 1, f);
 	}
 	std::fclose(f);
+}
+
+/*=========================================================================
+ * Optional live visualization: best-effort, fire-and-forget XY-projection
+ * density streaming to a separate viewer process (see pic3d_v2/live_vis.py)
+ * over a plain localhost TCP socket. Disabled unless PYSOL_VIS_PORT is set
+ * in the environment - existing configs/tests that never set it never
+ * open a socket at all, so this cannot affect them.
+ *
+ * Each fragment sends its OWN local sum-over-z (interior cells only, no
+ * ghost) as one ni x nj tile, tagged with its (ii,jj,kk) fragment
+ * coordinates; the viewer accumulates every fragment sharing the same
+ * (ii,jj) column (i.e. every kk) into one global XY projection - exactly
+ * the same quantity write_density_files() computes offline via
+ * `arr.sum(axis=2)`. One connection per message, closed right after -
+ * simple to reason about under OMP concurrency (every fragment's kernel
+ * call opens its own independent socket, no shared mutable state besides
+ * the "connection failed" warn-once flag below), at the cost of a little
+ * TCP setup overhead that a diagnostics/preview tool doesn't need to care
+ * about. Host byte order throughout (no htonl/ntohl on the header's ints,
+ * no byte-swap on the payload doubles): this is a loopback dev tool, not
+ * a cross-machine wire protocol, so sender and viewer are always the same
+ * machine/endianness.
+ *=========================================================================*/
+struct VisHeader
+{
+	std::int32_t magic;
+	std::int32_t ts;
+	std::int32_t ii, jj, kk;
+	std::int32_t nfx, nfy, nfz;
+	std::int32_t ni, nj; // this fragment's interior tile size (x,y)
+};
+
+inline bool vis_send_all(int fd, const void* buf, std::size_t len)
+{
+	const char* p = static_cast<const char*>(buf);
+	while (len > 0)
+	{
+		ssize_t n = ::send(fd, p, len, MSG_NOSIGNAL);
+		if (n <= 0) return false;
+		p += n;
+		len -= static_cast<std::size_t>(n);
+	}
+	return true;
+}
+
+void send_density_xy_block(int ts, int ii, int jj, int kk, int nfx, int nfy, int nfz,
+                            int bn, int bm, int bl,
+                            int n, int m, int l, const double* ro)
+{
+	const char* port_str = std::getenv("PYSOL_VIS_PORT");
+	if (port_str == nullptr) return; // live visualization not requested
+
+	std::vector<double> tile(static_cast<std::size_t>(bn) * static_cast<std::size_t>(bm));
+	for (int li = 1; li <= bn; ++li)
+	for (int lj = 1; lj <= bm; ++lj)
+	{
+		double s = 0.0;
+		for (int lk = 1; lk <= bl; ++lk) s += ro[flat3(li, lj, lk, m, l)];
+		tile[(li - 1) * bm + (lj - 1)] = s;
+	}
+
+	const char* host_str = std::getenv("PYSOL_VIS_HOST");
+	if (host_str == nullptr) host_str = "127.0.0.1";
+
+	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return;
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(static_cast<std::uint16_t>(std::atoi(port_str)));
+	::inet_pton(AF_INET, host_str, &addr.sin_addr);
+
+	if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+	{
+		::close(fd);
+			std::fprintf(stderr,
+			              "send_density_xy_block: could not connect to live visualizer at %s:%s "
+			              "- is live_vis.py running? Live visualization disabled for the rest of this run.\n",
+			              host_str, port_str);
+		return;
+	}
+
+	VisHeader hdr{};
+	hdr.magic = 0x50563344;
+	hdr.ts = ts; hdr.ii = ii; hdr.jj = jj; hdr.kk = kk;
+	hdr.nfx = nfx; hdr.nfy = nfy; hdr.nfz = nfz;
+	hdr.ni = bn; hdr.nj = bm;
+
+	if (vis_send_all(fd, &hdr, sizeof(hdr)))
+	{
+		vis_send_all(fd, tile.data(), tile.size() * sizeof(double));
+	}
+
+	::close(fd);
 }
