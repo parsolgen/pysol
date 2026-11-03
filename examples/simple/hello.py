@@ -56,7 +56,7 @@ def solver():
                                  KernelArgument("dx", True, Type.Double),
                                  KernelArgument("dy", True, Type.Double),
                                  KernelArgument("prev", True, Type.Double, 2),
-                                 KernelArgument("curr", False, Type.Double, 2)])
+                                 KernelArgument("curr", False, Type.Double, 2)], [pysol.CPU, pysol.GOOPAX])
     print_it_k = import_kernel("print_iter", [KernelArgument("it", True, Type.Int)])
     nb : Type.Int = 10
     mb : Type.Int = 10

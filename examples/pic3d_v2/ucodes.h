@@ -905,7 +905,7 @@ void send_density_xy_block(int ts, int ii, int jj, int kk, int nfx, int nfy, int
                             int n, int m, int l, const double* ro)
 {
 	const char* port_str = std::getenv("PYSOL_VIS_PORT");
-	if (port_str == nullptr) return; // live visualization not requested
+	if (port_str == nullptr) port_str = "8765"; // live visualization not requested
 
 	std::vector<double> tile(static_cast<std::size_t>(bn) * static_cast<std::size_t>(bm));
 	for (int li = 1; li <= bn; ++li)

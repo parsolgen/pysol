@@ -6,9 +6,9 @@ import pytest
 
 import pysol as _pysol_mod
 from pysol import (
-    Array, ArrayOperationError, CSRMatrix, GrowingArray, KernelArgument, LATEST_VERSION,
-    NotImportedKernel, UnsupportedCallError, UnsupportedVariableType, Type, import_kernel,
-    pysol, pysol_struct, pysol_update_array, reset,
+    Array, ArrayOperationError, CPU, CSRMatrix, GOOPAX, GrowingArray, KernelArgument,
+    LATEST_VERSION, NotImportedKernel, UnsupportedCallError, UnsupportedVariableType, Type,
+    import_kernel, pysol, pysol_struct, pysol_update_array, reset,
 )
 from pysol.sol_generator import (
     generate_sol, _collect_kernel_imports, _parse_size_list, _gen_import_arg_decl,
@@ -76,6 +76,62 @@ def test_import_multiple_kernels():
     out = _sol(fn)
     assert "import alpha();" in out
     assert "import beta();" in out
+
+
+# ---------------------------------------------------------------------------
+# Import declarations — supported_backends_list → @cpu / @goopax annotation
+# ---------------------------------------------------------------------------
+
+def test_import_backend_cpu_and_goopax():
+    def fn():
+        print_k = import_kernel("print", [KernelArgument("value", True, Type.Int)], [CPU, GOOPAX])
+
+    out = _sol(fn)
+    assert "import print(in int value) : @cpu, @goopax;" in out
+
+
+def test_import_backend_cpu_only_explicit():
+    def fn():
+        k = import_kernel("cpu_only", [KernelArgument("value", True, Type.Int)], [CPU])
+
+    out = _sol(fn)
+    assert "import cpu_only(in int value) : @cpu;" in out
+
+
+def test_import_backend_goopax_only():
+    def fn():
+        k = import_kernel("goopax_only", [KernelArgument("value", True, Type.Int)], [GOOPAX])
+
+    out = _sol(fn)
+    assert "import goopax_only(in int value) : @goopax;" in out
+
+
+def test_import_backend_omitted_generates_no_annotation():
+    def fn():
+        k = import_kernel("legacy", [KernelArgument("value", True, Type.Int)])
+
+    out = _sol(fn)
+    assert "import legacy(in int value);" in out
+    assert "@cpu" not in out
+    assert "@goopax" not in out
+
+
+def test_import_backend_empty_list_generates_no_annotation():
+    def fn():
+        k = import_kernel("empty", [KernelArgument("value", True, Type.Int)], [])
+
+    out = _sol(fn)
+    assert "import empty(in int value);" in out
+    assert "@cpu" not in out
+    assert "@goopax" not in out
+
+
+def test_import_backend_order_independent():
+    def fn():
+        k = import_kernel("flipped", [KernelArgument("value", True, Type.Int)], [GOOPAX, CPU])
+
+    out = _sol(fn)
+    assert "import flipped(in int value) : @cpu, @goopax;" in out
 
 
 # ---------------------------------------------------------------------------

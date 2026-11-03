@@ -513,7 +513,7 @@ def pic3d_pysol():
     am : Type.Double = pm / 1000996.0
 
     #tau : Type.Double = 0.0001
-    tau : Type.Double = 0.0000001
+    tau : Type.Double = 0.0001
     w_relax : Type.Double = 1.0
 
     num_ts : Type.Int = 1000

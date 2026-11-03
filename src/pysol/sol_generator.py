@@ -117,6 +117,19 @@ def _is_import_kernel_call(node: ast.AST) -> bool:
     )
 
 
+# Recognised backend names (Backend.CPU / bare CPU, Backend.GOOPAX / bare GOOPAX).
+_BACKEND_NAMES = {"CPU", "GOOPAX"}
+
+
+def _ast_to_backend_name(node: ast.AST) -> Optional[str]:
+    """'CPU' / Backend.CPU-style AST node → 'CPU' (or 'GOOPAX'); else None."""
+    if isinstance(node, ast.Name) and node.id in _BACKEND_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in _BACKEND_NAMES:
+        return node.attr
+    return None
+
+
 # Array-reduction operators: sum(A) / max(A) / min(A) → reduce(%<op>, A[:]...[:])
 _REDUCE_OPS = {"sum", "max", "min"}
 
@@ -238,12 +251,17 @@ def _parse_size_list(size_str: str) -> List[str]:
 
 def _collect_kernel_imports(
     func_def: ast.FunctionDef,
-) -> Dict[str, Tuple[str, List[KernelArgument]]]:
+) -> Dict[str, Tuple[str, List[KernelArgument], List[str]]]:
     """
-    Return {var_name: (kernel_name, [KernelArgument, ...])}
+    Return {var_name: (kernel_name, [KernelArgument, ...], [backend_name, ...])}
     for every  var = import_kernel(...)  assignment in func_def.
+
+    backend_name is "CPU" or "GOOPAX", taken from the call's optional 3rd
+    positional (or `supported_backends=`) argument. The backend list is []
+    when that argument is omitted, or given as an empty list — both mean
+    "no .sol backend annotation" (see _gen_backend_suffix).
     """
-    result: Dict[str, Tuple[str, List[KernelArgument]]] = {}
+    result: Dict[str, Tuple[str, List[KernelArgument], List[str]]] = {}
     for node in ast.walk(func_def):
         if not (isinstance(node, ast.Assign) and _is_import_kernel_call(node.value)):
             continue
@@ -262,8 +280,37 @@ def _collect_kernel_imports(
                     if karg is not None:
                         kernel_args.append(karg)
 
-        result[var] = (kernel_name, kernel_args)
+        backends_node: Optional[ast.AST] = None
+        if len(call_args) >= 3:
+            backends_node = call_args[2]
+        else:
+            for kw in node.value.keywords:
+                if kw.arg == "supported_backends":
+                    backends_node = kw.value
+
+        backends: List[str] = []
+        if isinstance(backends_node, ast.List):
+            for elt in backends_node.elts:
+                bname = _ast_to_backend_name(elt)
+                if bname is not None:
+                    backends.append(bname)
+
+        result[var] = (kernel_name, kernel_args, backends)
     return result
+
+
+def _gen_backend_suffix(backends: List[str]) -> str:
+    """
+    ['CPU']           → ' : @cpu;'
+    ['GOOPAX']        → ' : @goopax;'
+    ['CPU', 'GOOPAX'] (any order) → ' : @cpu, @goopax;'
+    []                → ''  (nothing generated)
+    """
+    if not backends:
+        return ""
+    present = set(backends)
+    parts = [b.lower() for b in ("CPU", "GOOPAX") if b in present]
+    return f" : {', '.join(f'@{p}' for p in parts)};"
 
 
 # ── Struct type declaration ───────────────────────────────────────────────────
@@ -326,7 +373,7 @@ class _SolWriter:
         self,
         func_name: str,
         func_def: ast.FunctionDef,
-        imported_kernels: Dict[str, Tuple[str, List[KernelArgument]]],
+        imported_kernels: Dict[str, Tuple[str, List[KernelArgument], List[str]]],
         arrays: Dict[str, _ArrayInfo],
         csr_matrices: Optional[Dict[str, _CSRMatrixInfo]] = None,
     ) -> None:
@@ -334,10 +381,13 @@ class _SolWriter:
         self._func_def = func_def
         # Split for independent lookup
         self._kernels: Dict[str, str] = {
-            var: name for var, (name, _) in imported_kernels.items()
+            var: name for var, (name, _, _) in imported_kernels.items()
         }
         self._kernel_arg_lists: Dict[str, List[KernelArgument]] = {
-            var: kargs for var, (_, kargs) in imported_kernels.items()
+            var: kargs for var, (_, kargs, _) in imported_kernels.items()
+        }
+        self._kernel_backends: Dict[str, List[str]] = {
+            var: backends for var, (_, _, backends) in imported_kernels.items()
         }
         self._arrays = arrays
         self._csr_matrices: Dict[str, _CSRMatrixInfo] = csr_matrices or {}
@@ -410,7 +460,11 @@ class _SolWriter:
             decls: List[str] = []
             for karg in kargs:
                 decls.extend(_gen_import_arg_decl(karg))
-            lines.append(f"import {kernel_name}({', '.join(decls)});")
+            backend_suffix = _gen_backend_suffix(self._kernel_backends.get(var_name, []))
+            if backend_suffix:
+                lines.append(f"import {kernel_name}({', '.join(decls)}){backend_suffix}")
+            else:
+                lines.append(f"import {kernel_name}({', '.join(decls)});")
         for imp in self._hoist_imports:
             lines.append(imp)
         if self._kernels or self._hoist_imports:

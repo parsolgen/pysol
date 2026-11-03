@@ -10,7 +10,7 @@ from pysol.decorator import (
     UnsupportedVariableType, ArrayOperationError, UnsupportedCallError,
     UnsupportedStructFieldType,
 )
-from pysol.kernel import KernelArgument, import_kernel
+from pysol.kernel import KernelArgument, import_kernel, Backend, CPU, GOOPAX
 from pysol.config import load_config, get_config
 
 __all__ = [
@@ -23,6 +23,6 @@ __all__ = [
     "SolLibraryNotFoundError", "SolFunctionNotFoundError", "SolInitError", "SolCompileError",
     "UnsupportedVariableType", "ArrayOperationError", "UnsupportedCallError",
     "UnsupportedStructFieldType",
-    "KernelArgument", "import_kernel",
+    "KernelArgument", "import_kernel", "Backend", "CPU", "GOOPAX",
     "load_config", "get_config",
 ]
