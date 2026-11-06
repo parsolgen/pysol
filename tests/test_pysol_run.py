@@ -66,6 +66,37 @@ def test_pysol_run_unregistered_raises():
 
 
 # ---------------------------------------------------------------------------
+# Library loaded with RTLD_GLOBAL (needed for libraries, e.g. MKL, that
+# dlopen their own plugins expecting globally-visible symbols - see
+# examples/bicg, where RTLD_LOCAL caused an "undefined symbol" crash only
+# reproducible via ctypes, never when running the equivalent program
+# directly as a binary)
+# ---------------------------------------------------------------------------
+
+def test_pysol_run_uses_rtld_global(tmp_path, monkeypatch):
+    @pysol
+    def fn_global():
+        pass
+
+    received_mode = {}
+
+    def _fake_cdll(_path, mode=None):
+        received_mode["mode"] = mode
+        return _make_lib()
+
+    (tmp_path / "fn_global.so").write_bytes(b"")
+    _registry["fn_global"].__pysol_sol_path__ = str(tmp_path / "fn_global.sol")
+    monkeypatch.setattr(ctypes, "CDLL", _fake_cdll)
+    monkeypatch.setattr(_ctypes, "dlclose", lambda _h: None)
+
+    pysol_run("fn_global")
+
+    assert received_mode["mode"] == ctypes.RTLD_GLOBAL
+
+    del fn_global
+
+
+# ---------------------------------------------------------------------------
 # Error: .so file missing
 # ---------------------------------------------------------------------------
 
@@ -91,7 +122,7 @@ def test_pysol_run_missing_init_raises(tmp_path, monkeypatch):
 
     (tmp_path / "fn_no_sgc.so").write_bytes(b"")
     _registry["fn_no_sgc"].__pysol_sol_path__ = str(tmp_path / "fn_no_sgc.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(has_init=False))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(has_init=False))
 
     with pytest.raises(SolFunctionNotFoundError, match="init_pslib"):
         pysol_run("fn_no_sgc")
@@ -110,7 +141,7 @@ def test_pysol_run_missing_fini_raises(tmp_path, monkeypatch):
 
     (tmp_path / "fn_no_so.so").write_bytes(b"")
     _registry["fn_no_so"].__pysol_sol_path__ = str(tmp_path / "fn_no_so.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(has_fini=False))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(has_fini=False))
 
     with pytest.raises(SolFunctionNotFoundError, match="fini_pslib"):
         pysol_run("fn_no_so")
@@ -129,7 +160,7 @@ def test_pysol_run_init_nonzero_raises(tmp_path, monkeypatch):
 
     (tmp_path / "fn_sgc.so").write_bytes(b"")
     _registry["fn_sgc"].__pysol_sol_path__ = str(tmp_path / "fn_sgc.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(init_rc=1))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(init_rc=1))
 
     with pytest.raises(SolInitError, match="1"):
         pysol_run("fn_sgc")
@@ -144,7 +175,7 @@ def test_pysol_run_init_nonzero_code_in_message(tmp_path, monkeypatch):
 
     (tmp_path / "fn_compiler.so").write_bytes(b"")
     _registry["fn_compiler"].__pysol_sol_path__ = str(tmp_path / "fn_compiler.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(init_rc=42))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(init_rc=42))
 
     with pytest.raises(SolInitError, match="42"):
         pysol_run("fn_compiler")
@@ -163,7 +194,7 @@ def test_pysol_run_missing_symbol_raises(tmp_path, monkeypatch):
 
     (tmp_path / "fn_bad_sym.so").write_bytes(b"")
     _registry["fn_bad_sym"].__pysol_sol_path__ = str(tmp_path / "fn_bad_sym.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(has_fn=False))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(has_fn=False))
 
     with pytest.raises(SolFunctionNotFoundError, match="fn_bad_sym"):
         pysol_run("fn_bad_sym")
@@ -183,7 +214,7 @@ def test_pysol_run_calls_function(tmp_path, monkeypatch):
     call_log = []
     (tmp_path / "fn_ok.so").write_bytes(b"")
     _registry["fn_ok"].__pysol_sol_path__ = str(tmp_path / "fn_ok.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(calls=call_log))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(calls=call_log))
     monkeypatch.setattr(_ctypes, "dlclose", lambda _h: None)
 
     pysol_run("fn_ok")
@@ -199,7 +230,7 @@ def test_pysol_run_returns_function_result(tmp_path, monkeypatch):
 
     (tmp_path / "fn_retval.so").write_bytes(b"")
     _registry["fn_retval"].__pysol_sol_path__ = str(tmp_path / "fn_retval.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(fn_result=42))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(fn_result=42))
     monkeypatch.setattr(_ctypes, "dlclose", lambda _h: None)
 
     result = pysol_run("fn_retval")
@@ -217,7 +248,7 @@ def test_pysol_run_call_order(tmp_path, monkeypatch):
     call_log = []
     (tmp_path / "fn_paths.so").write_bytes(b"")
     _registry["fn_paths"].__pysol_sol_path__ = str(tmp_path / "fn_paths.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib(calls=call_log))
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib(calls=call_log))
     monkeypatch.setattr(_ctypes, "dlclose", lambda _h: None)
 
     pysol_run("fn_paths")
@@ -254,7 +285,7 @@ def test_pysol_run_fini_called_on_main_exception(tmp_path, monkeypatch):
 
     (tmp_path / "fn_two_steps.so").write_bytes(b"")
     _registry["fn_two_steps"].__pysol_sol_path__ = str(tmp_path / "fn_two_steps.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _BrokenLib())
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _BrokenLib())
     monkeypatch.setattr(_ctypes, "dlclose", lambda _h: closed.append(True))
 
     with pytest.raises(RuntimeError, match="main failed"):
@@ -278,7 +309,7 @@ def test_pysol_run_unloads_library(tmp_path, monkeypatch):
     closed_handles = []
     (tmp_path / "fn_ok.so").write_bytes(b"")
     _registry["fn_ok"].__pysol_sol_path__ = str(tmp_path / "fn_ok.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _make_lib())
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _make_lib())
     monkeypatch.setattr(_ctypes, "dlclose", lambda h: closed_handles.append(h))
 
     pysol_run("fn_ok")
@@ -316,7 +347,7 @@ def test_pysol_run_passes_argv(tmp_path, monkeypatch):
 
     (tmp_path / "fn_paths.so").write_bytes(b"")
     _registry["fn_paths"].__pysol_sol_path__ = str(tmp_path / "fn_paths.sol")
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: _ArgvLib())
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kw: _ArgvLib())
     monkeypatch.setattr(_ctypes, "dlclose", lambda _h: None)
     monkeypatch.setattr(sys, "argv", ["myprogram", "--flag"])
 

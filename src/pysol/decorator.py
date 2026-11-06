@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import ctypes
 import _ctypes
+import dataclasses
 import functools
 import inspect
 import os
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from pysol.array import Array
 
 from pysol.config import get_config
+from pysol.types import Type
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -60,6 +62,10 @@ class ArrayOperationError(Exception):
 
 class UnsupportedCallError(Exception):
     """Raised during .sol generation when a call is not supported (e.g. wrong array dimensionality)."""
+
+
+class UnsupportedStructFieldType(Exception):
+    """Raised by @pysol_struct when a field's annotation isn't Type.Int/Float/Double."""
 
 
 # Regex matching $$type(array_name) tokens in pattern bodies
@@ -140,15 +146,29 @@ def _is_valid_if(node: ast.If) -> bool:
       2. var op var         — comparison or boolean op between two variables
       3. var op const       — comparison or boolean op, variable on the left
       4. const op var       — comparison or boolean op, constant on the left
+      5. not expr(v1, ..., vn) — negation of form 1 (e.g. "not is_zero(b)")
     At least one side of a binary expression must be a variable.
+
+    is_zero(...) is special-cased within form 1/5: its argument may also be
+    a CSR matrix block subscript (is_zero(A[i][j])), not just a plain Name.
     """
+
+    def _call_args_ok(call: ast.Call) -> bool:
+        if _is_zero_call(call):
+            return (
+                len(call.args) == 1
+                and isinstance(call.args[0], (ast.Name, ast.Subscript))
+                and not call.keywords
+            )
+        return all(isinstance(a, ast.Name) for a in call.args) and all(
+            isinstance(kw.value, ast.Name) for kw in call.keywords
+        )
+
     test = node.test
 
-    # Form 1: all-variable call
+    # Form 1: all-variable call (or is_zero(block-subscript))
     if isinstance(test, ast.Call):
-        return all(isinstance(a, ast.Name) for a in test.args) and all(
-            isinstance(kw.value, ast.Name) for kw in test.keywords
-        )
+        return _call_args_ok(test)
 
     def _is_atom(n: ast.AST) -> bool:
         return isinstance(n, (ast.Name, ast.Constant))
@@ -168,21 +188,84 @@ def _is_valid_if(node: ast.If) -> bool:
     if isinstance(test, ast.BoolOp) and len(test.values) == 2:
         return _valid_binary(test.values[0], test.values[1])
 
+    # Form 5: not expr(v1, ..., vn)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(
+        test.operand, ast.Call
+    ):
+        return _call_args_ok(test.operand)
+
     return False
 
 
 def _is_array_call(node: ast.AST) -> bool:
+    """True for either Array(...) or GrowingArray(...) constructor calls."""
     if not isinstance(node, ast.Call):
         return False
     func = node.func
-    return (isinstance(func, ast.Name) and func.id == "Array") or (
-        isinstance(func, ast.Attribute) and func.attr == "Array"
+    name = func.id if isinstance(func, ast.Name) else (
+        func.attr if isinstance(func, ast.Attribute) else None
+    )
+    return name in ("Array", "GrowingArray")
+
+
+def _is_growing_array_call(node: ast.AST) -> bool:
+    """True specifically for GrowingArray(...) constructor calls."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "GrowingArray") or (
+        isinstance(func, ast.Attribute) and func.attr == "GrowingArray"
+    )
+
+
+def _is_csr_matrix_call(node: ast.AST) -> bool:
+    """True for CSRMatrix(...) constructor calls."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "CSRMatrix") or (
+        isinstance(func, ast.Attribute) and func.attr == "CSRMatrix"
+    )
+
+
+def _is_csr_block_annotation(node: ast.AST) -> bool:
+    """True for a Type.CSRBlock(...) annotation/type expression."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "CSRBlock"
+    )
+
+
+def _is_zero_call(node: ast.AST) -> bool:
+    """True for is_zero(...) calls, e.g. is_zero(b) or is_zero(A[i][j])."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "is_zero") or (
+        isinstance(func, ast.Attribute) and func.attr == "is_zero"
+    )
+
+
+def _is_reset_call(node: ast.AST) -> bool:
+    """True for reset(...) calls, e.g. reset(A) where A is an Array or CSRMatrix."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "reset") or (
+        isinstance(func, ast.Attribute) and func.attr == "reset"
     )
 
 
 # ── Info containers ──────────────────────────────────────────────────────────
 
-_ARRAY_PARAMS = ("n_dims", "n_block_dims", "array_size", "block_size", "type")
+# Array(n_dims, n_block_dims, array_size, block_size, type, is_single_version)
+_ARRAY_PARAMS = (
+    "n_dims", "n_block_dims", "array_size", "block_size", "type", "is_single_version",
+)
+# GrowingArray(n_dims, array_size, type) — block dimension is always 1, so it
+# takes no n_block_dims / block_size arguments.
+_GROWING_ARRAY_PARAMS = ("n_dims", "array_size", "type")
 
 
 @dataclass
@@ -193,6 +276,27 @@ class _ArrayInfo:
     n_block_dims: str
     array_size: str
     block_size: str
+    elem_type: str
+    is_growing: bool = False
+    is_single_version: bool = False
+
+
+# CSRMatrix([dim1, dim2], [n_blocks_1, n_blocks_2], nnz, ia, ja, a, type)
+_CSR_MATRIX_PARAMS = ("size", "n_blocks", "nnz", "ia", "ja", "a", "type")
+
+
+@dataclass
+class _CSRMatrixInfo:
+    line: int
+    var: str
+    dim1: str
+    dim2: str
+    n_blocks_1: str
+    n_blocks_2: str
+    nnz: str
+    ia: str
+    ja: str
+    a: str
     elem_type: str
 
 
@@ -219,6 +323,7 @@ class _IfInfo:
 class _Analysis:
     name: str
     arrays: List[_ArrayInfo] = field(default_factory=list)
+    csr_matrices: List[_CSRMatrixInfo] = field(default_factory=list)
     for_loops: List[_ForInfo] = field(default_factory=list)
     while_loops: List[_WhileInfo] = field(default_factory=list)
     if_stmts: List[_IfInfo] = field(default_factory=list)
@@ -227,10 +332,14 @@ class _Analysis:
 # ── Static analysis ──────────────────────────────────────────────────────────
 
 def _extract_array(line: int, var: str, call: ast.Call) -> _ArrayInfo:
-    values = {p: "?" for p in _ARRAY_PARAMS}
+    is_growing = _is_growing_array_call(call)
+    param_names = _GROWING_ARRAY_PARAMS if is_growing else _ARRAY_PARAMS
+    values = {p: "?" for p in param_names}
+    if "is_single_version" in values:
+        values["is_single_version"] = "False"  # optional, defaults to False
     for i, arg in enumerate(call.args):
-        if i < len(_ARRAY_PARAMS):
-            values[_ARRAY_PARAMS[i]] = _unparse(arg)
+        if i < len(param_names):
+            values[param_names[i]] = _unparse(arg)
     for kw in call.keywords:
         if kw.arg in values:
             values[kw.arg] = _unparse(kw.value)
@@ -238,9 +347,59 @@ def _extract_array(line: int, var: str, call: ast.Call) -> _ArrayInfo:
         line=line,
         var=var,
         n_dims=values["n_dims"],
-        n_block_dims=values["n_block_dims"],
+        n_block_dims="0" if is_growing else values["n_block_dims"],
         array_size=values["array_size"],
-        block_size=values["block_size"],
+        block_size="[]" if is_growing else values["block_size"],
+        elem_type=values["type"],
+        is_growing=is_growing,
+        is_single_version=values.get("is_single_version") == "True",
+    )
+
+
+def _extract_csr_matrix(line: int, var: str, call: ast.Call) -> _CSRMatrixInfo:
+    values = {p: "?" for p in _CSR_MATRIX_PARAMS}
+    for i, arg in enumerate(call.args):
+        if i < len(_CSR_MATRIX_PARAMS):
+            values[_CSR_MATRIX_PARAMS[i]] = _unparse(arg)
+    for kw in call.keywords:
+        if kw.arg in values:
+            values[kw.arg] = _unparse(kw.value)
+
+    def _unpack_pair(node: ast.AST, label: str) -> Tuple[str, str]:
+        if isinstance(node, ast.List) and len(node.elts) == 2:
+            return _unparse(node.elts[0]), _unparse(node.elts[1])
+        raise ValueError(
+            f"CSRMatrix '{var}': {label} must be a 2-element list literal "
+            f"[dim1, dim2] / [n_blocks_1, n_blocks_2], got '{_unparse(node)}'"
+        )
+
+    size_node = next((a for i, a in enumerate(call.args) if i == 0), None)
+    n_blocks_node = next((a for i, a in enumerate(call.args) if i == 1), None)
+    for kw in call.keywords:
+        if kw.arg == "size":
+            size_node = kw.value
+        elif kw.arg == "n_blocks":
+            n_blocks_node = kw.value
+
+    if size_node is None or n_blocks_node is None:
+        raise ValueError(
+            f"CSRMatrix '{var}': expected CSRMatrix([dim1, dim2], "
+            f"[n_blocks_1, n_blocks_2], nnz, ia, ja, a, type)"
+        )
+    dim1, dim2 = _unpack_pair(size_node, "size")
+    n_blocks_1, n_blocks_2 = _unpack_pair(n_blocks_node, "n_blocks")
+
+    return _CSRMatrixInfo(
+        line=line,
+        var=var,
+        dim1=dim1,
+        dim2=dim2,
+        n_blocks_1=n_blocks_1,
+        n_blocks_2=n_blocks_2,
+        nnz=values["nnz"],
+        ia=values["ia"],
+        ja=values["ja"],
+        a=values["a"],
         elem_type=values["type"],
     )
 
@@ -262,6 +421,18 @@ def _analyse(func: Callable) -> _Analysis:
 
         elif isinstance(node, ast.AnnAssign) and node.value is not None and _is_array_call(node.value):
             analysis.arrays.append(_extract_array(abs_line, _target_name(node.target), node.value))
+
+        elif isinstance(node, ast.Assign) and _is_csr_matrix_call(node.value):
+            for target in node.targets:
+                analysis.csr_matrices.append(
+                    _extract_csr_matrix(abs_line, _target_name(target), node.value)
+                )
+
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+                and _is_csr_matrix_call(node.value)):
+            analysis.csr_matrices.append(
+                _extract_csr_matrix(abs_line, _target_name(node.target), node.value)
+            )
 
         elif isinstance(node, ast.For):
             if not _is_range_for(node):
@@ -295,6 +466,7 @@ def _analyse(func: Callable) -> _Analysis:
             ))
 
     analysis.arrays.sort(key=lambda x: x.line)
+    analysis.csr_matrices.sort(key=lambda x: x.line)
     analysis.for_loops.sort(key=lambda x: x.line)
     analysis.while_loops.sort(key=lambda x: x.line)
     analysis.if_stmts.sort(key=lambda x: x.line)
@@ -304,6 +476,47 @@ def _analyse(func: Callable) -> _Analysis:
 # ── Function registry ────────────────────────────────────────────────────────
 
 _registry: Dict[str, Callable] = {}
+
+
+# ── Struct types ──────────────────────────────────────────────────────────────
+
+# Only these scalar types may appear as a @pysol_struct field.
+_STRUCT_FIELD_TYPES = (Type.Int, Type.Float, Type.Double)
+
+# struct class name -> [(field_name, Type), ...] in declaration order.
+_struct_registry: Dict[str, List[Tuple[str, Type]]] = {}
+
+
+def pysol_struct(cls: type) -> type:
+    """
+    Decorator for a plain class that declares a parsolgen struct type, used
+    the same way as @dataclass: every class-level annotation must be one of
+    Type.Int, Type.Float, or Type.Double.
+
+    The decorated class becomes a real @dataclass (so it remains usable as a
+    normal Python object) and is registered by name so that @pysol-decorated
+    functions can reference it as the element type of an Array / GrowingArray,
+    or as a variable's type annotation.
+    """
+    cls = dataclasses.dataclass(cls)
+
+    fields: List[Tuple[str, Type]] = []
+    for f in dataclasses.fields(cls):
+        if f.type not in _STRUCT_FIELD_TYPES:
+            raise UnsupportedStructFieldType(
+                f"pysol_struct '{cls.__name__}': field '{f.name}' has unsupported "
+                f"type {f.type!r}; supported types are Type.Int, Type.Float, Type.Double"
+            )
+        fields.append((f.name, f.type))
+
+    if not fields:
+        raise UnsupportedStructFieldType(
+            f"pysol_struct '{cls.__name__}' declares no fields"
+        )
+
+    cls.__pysol_struct_fields__ = fields
+    _struct_registry[cls.__name__] = fields
+    return cls
 
 
 # ── Public decorator ─────────────────────────────────────────────────────────
@@ -426,7 +639,14 @@ def pysol_run(name: str):
         )
 
     try:
-        lib = ctypes.CDLL(so_path)
+        # RTLD_GLOBAL, not ctypes' default RTLD_LOCAL: some compiled .sol
+        # programs link against libraries (e.g. MKL) that themselves
+        # dlopen plugins expecting to resolve symbols from their loading
+        # process's global scope - with RTLD_LOCAL those plugin loads
+        # fail at runtime with "undefined symbol" errors that never show
+        # up when the same .so is instead the main executable (which the
+        # OS always loads with globally-visible symbols).
+        lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
     except OSError as exc:
         raise SolLibraryNotFoundError(
             f"Failed to load shared library '{so_path}': {exc}"
@@ -630,4 +850,19 @@ def pysol_update_array(
     destination: Array,
     destination_version: int,
 ) -> None:
+    pass
+
+
+def pysol_update_array_3d_26_full_sum(
+    source: Array,
+    source_version: int,
+    destination: Array,
+    destination_version: int,
+) -> None:
+    """26-neighbor additive halo exchange for an n_dims=3 Array - see
+    exchange_3d_26_full_sum.sol. Generalizes examples/pic3d_v2's
+    exchange_density_additive_block: every block's data overlaps its
+    neighbors' by a 2-cell-wide slab on each face/edge/corner, and the
+    correct destination value there is the SUM of every overlapping
+    block's contribution, not a copy from one of them."""
     pass

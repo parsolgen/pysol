@@ -56,7 +56,7 @@ def solver():
                                  KernelArgument("dx", True, Type.Double),
                                  KernelArgument("dy", True, Type.Double),
                                  KernelArgument("prev", True, Type.Double, 2),
-                                 KernelArgument("curr", False, Type.Double, 2)])
+                                 KernelArgument("curr", False, Type.Double, 2)], [pysol.CPU, pysol.GOOPAX])
     print_it_k = import_kernel("print_iter", [KernelArgument("it", True, Type.Int)])
     nb : Type.Int = 10
     mb : Type.Int = 10
@@ -76,7 +76,7 @@ def solver():
             init_el_k(i, j, nb, mb, A[i][j])
 
     it : Type.Int = 0
-    while it < 5000:
+    while it < 10000:
         print_it_k(it)
         for i in range(nb):
             for j in range(mb):
@@ -85,7 +85,7 @@ def solver():
         it = it + 2
     for i in range(nb):
         for j in range(mb):
-            print_el_k(i, j, A[it - 2, i][j])
+            print_el_k(i, j, A[it, i][j])
 
 def print_command_line_arguments():
     for arg in sys.argv[1:]:

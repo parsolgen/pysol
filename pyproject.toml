@@ -1,18 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=40.8.0", "wheel"]
 build-backend = "setuptools.build_meta"
-
-[project]
-name = "pysol"
-version = "0.1.0"
-description = "A basic Python project"
-requires-python = ">=3.8"
-dependencies = []
-
-[project.optional-dependencies]
-dev = [
-    "pytest",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

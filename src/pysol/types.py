@@ -10,6 +10,18 @@ class Type(Enum):
     String = "String"
     Bool = "Bool"
 
+    @staticmethod
+    def CSRBlock(element_type: "Type") -> "CSRBlockType":
+        """
+        Type.CSRBlock(Type.Double) — the type of one block of a CSRMatrix
+        (see pysol.array.CSRMatrix). Used as a variable's type annotation
+        (``b : Type.CSRBlock(Type.Double) = A[i][j]``) or as a
+        KernelArgument's type (``KernelArgument("a", True,
+        Type.CSRBlock(Type.Double))``) — never as an Array/GrowingArray
+        element type.
+        """
+        return CSRBlockType(element_type)
+
 
 class ArrayType:
     """Descriptor for the shape and element type of an Array."""
@@ -40,6 +52,29 @@ class ArrayType:
             f"ArrayType(n_dims={self.n_dims}, n_block_dims={self.n_block_dims}, "
             f"element_type={self.element_type})"
         )
+
+
+class CSRBlockType:
+    """
+    Descriptor for the type of one block of a CSRMatrix: Type.CSRBlock(element_type).
+
+    Not constructed directly — use Type.CSRBlock(...) instead, the same way
+    ArrayType/ArrayElementType are never constructed directly either.
+    """
+
+    def __init__(self, element_type: Type) -> None:
+        self.element_type = element_type
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, CSRBlockType):
+            return NotImplemented
+        return self.element_type is other.element_type
+
+    def __hash__(self) -> int:
+        return hash(("CSRBlockType", self.element_type))
+
+    def __repr__(self) -> str:
+        return f"CSRBlockType({self.element_type})"
 
 
 class ArrayElementType:

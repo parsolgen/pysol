@@ -1,6 +1,9 @@
 import pytest
-from pysol import Array, NotSupportedIfStatement, NotSupportedLoop, Type, pysol
-from pysol.decorator import _analyse
+from pysol import (
+    Array, CSRMatrix, NotSupportedIfStatement, NotSupportedLoop, Type, pysol,
+    pysol_struct, UnsupportedStructFieldType,
+)
+from pysol.decorator import _analyse, _struct_registry
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +44,23 @@ def test_detects_bare_array():
     assert a.arrays[0].array_size == "[10]"
     assert a.arrays[0].block_size == "[10]"
     assert a.arrays[0].elem_type == "Type.Float"
+    assert a.arrays[0].is_single_version is False
+
+
+def test_detects_single_version_array_positional():
+    def fn():
+        a = Array(1, 1, [10], [10], Type.Float, True)
+
+    a = _run(fn)
+    assert a.arrays[0].is_single_version is True
+
+
+def test_detects_single_version_array_keyword():
+    def fn():
+        a = Array(1, 1, [10], [10], Type.Float, is_single_version=True)
+
+    a = _run(fn)
+    assert a.arrays[0].is_single_version is True
 
 
 def test_detects_qualified_array():
@@ -84,6 +104,64 @@ def test_no_arrays():
 
     a = _run(fn)
     assert a.arrays == []
+
+
+# ---------------------------------------------------------------------------
+# CSRMatrix detection
+# ---------------------------------------------------------------------------
+
+def test_detects_bare_csr_matrix():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    analysis = _run(fn)
+    assert len(analysis.csr_matrices) == 1
+    info = analysis.csr_matrices[0]
+    assert info.var == "A"
+    assert info.dim1 == "4"
+    assert info.dim2 == "4"
+    assert info.n_blocks_1 == "2"
+    assert info.n_blocks_2 == "2"
+    assert info.nnz == "6"
+    assert info.ia == "ia"
+    assert info.ja == "ja"
+    assert info.a == "a"
+    assert info.elem_type == "Type.Double"
+
+
+def test_detects_annotated_csr_matrix():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Float)
+        A: CSRMatrix = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Float)
+
+    analysis = _run(fn)
+    assert len(analysis.csr_matrices) == 1
+    assert analysis.csr_matrices[0].var == "A"
+    assert analysis.csr_matrices[0].elem_type == "Type.Float"
+
+
+def test_no_csr_matrices():
+    def fn():
+        x = 1 + 2
+
+    analysis = _run(fn)
+    assert analysis.csr_matrices == []
+
+
+def test_csr_matrix_bad_size_literal_raises():
+    def fn():
+        ia = Array(1, 1, [5], [1], Type.Int)
+        ja = Array(1, 1, [6], [1], Type.Int)
+        a = Array(1, 1, [6], [1], Type.Double)
+        A = CSRMatrix([4], [2, 2], 6, ia, ja, a, Type.Double)
+
+    with pytest.raises(ValueError):
+        _run(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +354,89 @@ def test_if_expression_arg_raises():
         _run(fn)
 
 
+# ---------------------------------------------------------------------------
+# is_zero(...) if-conditions
+# ---------------------------------------------------------------------------
+
+def test_if_is_zero_var():
+    def fn():
+        if is_zero(b):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "is_zero(b)"
+
+
+def test_if_not_is_zero_var():
+    def fn():
+        if not is_zero(b):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "not is_zero(b)"
+
+
+def test_if_is_zero_csr_block_subscript():
+    def fn():
+        if is_zero(A[i][j]):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "is_zero(A[i][j])"
+
+
+def test_if_not_is_zero_csr_block_subscript():
+    def fn():
+        if not is_zero(A[i][j]):
+            pass
+
+    result = _run(fn)
+    assert len(result.if_stmts) == 1
+    assert result.if_stmts[0].condition == "not is_zero(A[i][j])"
+
+
+def test_if_is_zero_too_many_args_raises():
+    def fn():
+        if is_zero(a, b):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_is_zero_literal_arg_raises():
+    def fn():
+        if is_zero(1):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_not_other_call_still_requires_variable_args():
+    """The 'not expr(...)' relaxation is general, but expr's own argument
+    rules (plain variables only, unless it's specifically is_zero) still
+    apply."""
+    def fn():
+        if not check(a + b):
+            pass
+
+    with pytest.raises(NotSupportedIfStatement):
+        _run(fn)
+
+
+def test_if_not_other_call_with_var_args_is_valid():
+    def fn():
+        if not check(a, b):
+            pass
+
+    result = _run(fn)
+    assert result.if_stmts[0].condition == "not check(a, b)"
+
+
 # --- binary comparison forms (now valid) ------------------------------------
 
 def test_if_var_op_var():
@@ -402,3 +563,76 @@ def test_sorted_by_line():
     a = _run(fn)
     lines = [info.line for info in a.arrays]
     assert lines == sorted(lines)
+
+
+# ---------------------------------------------------------------------------
+# @pysol_struct
+# ---------------------------------------------------------------------------
+
+def test_pysol_struct_registers_fields():
+    @pysol_struct
+    class _Vec2Struct:
+        x: Type.Double
+        y: Type.Float
+
+    assert _struct_registry["_Vec2Struct"] == [("x", Type.Double), ("y", Type.Float)]
+
+
+def test_pysol_struct_preserves_declaration_order():
+    @pysol_struct
+    class _OrderedStruct:
+        c: Type.Int
+        a: Type.Double
+        b: Type.Float
+
+    names = [name for name, _ in _struct_registry["_OrderedStruct"]]
+    assert names == ["c", "a", "b"]
+
+
+def test_pysol_struct_returns_usable_dataclass():
+    """The decorated class stays a real, constructible Python object."""
+    @pysol_struct
+    class _PointStruct:
+        x: Type.Double
+        y: Type.Double
+
+    p = _PointStruct(x=1.0, y=2.0)
+    assert p.x == 1.0
+    assert p.y == 2.0
+    assert p == _PointStruct(x=1.0, y=2.0)
+
+
+def test_pysol_struct_exposes_fields_on_class():
+    @pysol_struct
+    class _TaggedStruct:
+        v: Type.Int
+
+    assert _TaggedStruct.__pysol_struct_fields__ == [("v", Type.Int)]
+
+
+def test_pysol_struct_rejects_string_field():
+    with pytest.raises(UnsupportedStructFieldType, match="'s'"):
+        @pysol_struct
+        class _BadStruct:
+            s: Type.String
+
+
+def test_pysol_struct_rejects_bool_field():
+    with pytest.raises(UnsupportedStructFieldType):
+        @pysol_struct
+        class _BadBoolStruct:
+            flag: Type.Bool
+
+
+def test_pysol_struct_rejects_empty_class():
+    with pytest.raises(UnsupportedStructFieldType, match="no fields"):
+        @pysol_struct
+        class _EmptyStruct:
+            pass
+
+
+def test_pysol_struct_message_names_class():
+    with pytest.raises(UnsupportedStructFieldType, match="_NamedBadStruct"):
+        @pysol_struct
+        class _NamedBadStruct:
+            s: Type.String

@@ -6,9 +6,9 @@ export sub process_data()
     Array<float[32]> input_arr[64];
     Array<double[32]> output_arr[64];
     for (int i = 0; i < 64; i++) {
-        transform(i, input_arr{0}[i], output_arr{0}[i]);
+        transform(i, %block_n(input_arr, 0), input_arr{0}[i], %block_n(output_arr, 0), output_arr{0}[i]);
         if (i < 32) {
-            normalize(output_arr{0}[i], output_arr{0}[i]);
+            normalize(%block_n(output_arr, 0), output_arr{0}[i], %block_n(output_arr, 0), output_arr{0}[i]);
         }
     }
 }

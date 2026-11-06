@@ -1,6 +1,9 @@
 import inspect
 import pytest
-from pysol import Array, ArrayElement, KernelArgument, Type, import_kernel
+from pysol import (
+    Array, ArrayElement, Backend, CPU, CSRBlock, CSRMatrix, GOOPAX,
+    KernelArgument, Type, import_kernel,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -221,3 +224,74 @@ def test_call_rejects_wrong_scalar_where_element_expected():
     fn = import_kernel("k", [KernelArgument("blk", True, Type.Double, n_dims=2)])
     with pytest.raises(TypeError, match="'blk'"):
         fn(3.14)
+
+
+# ---------------------------------------------------------------------------
+# KernelArgument / import_kernel — Type.CSRBlock(...)
+# ---------------------------------------------------------------------------
+
+def test_csr_block_kernel_argument_attributes():
+    arg = KernelArgument("a", True, Type.CSRBlock(Type.Double))
+    assert arg.name == "a"
+    assert arg.n_dims == 0
+    assert arg.is_array_element is False
+    assert arg.type.element_type is Type.Double
+
+
+def test_csr_block_kernel_argument_repr_does_not_crash():
+    r = repr(KernelArgument("a", True, Type.CSRBlock(Type.Double)))
+    assert "a" in r
+    assert "in" in r
+    assert "n_dims" not in r
+
+
+def test_csr_block_annotation_is_csr_block():
+    fn = import_kernel("foo", [KernelArgument("a", True, Type.CSRBlock(Type.Double))])
+    assert inspect.signature(fn).parameters["a"].annotation is CSRBlock
+
+
+def test_call_accepts_csr_block_argument():
+    ia = Array(1, 1, [5], [1], Type.Int)
+    ja = Array(1, 1, [6], [1], Type.Int)
+    a = Array(1, 1, [6], [1], Type.Double)
+    A = CSRMatrix([4, 4], [2, 2], 6, ia, ja, a, Type.Double)
+    fn = import_kernel("foo", [KernelArgument("a", True, Type.CSRBlock(Type.Double))])
+    fn(A[0, 0])  # should not raise
+
+
+def test_call_rejects_non_csr_block_argument():
+    fn = import_kernel("foo", [KernelArgument("a", True, Type.CSRBlock(Type.Double))])
+    with pytest.raises(TypeError, match="'a'"):
+        fn(42)
+
+
+def test_struct_typed_argument_repr_does_not_crash():
+    # A @pysol_struct class is passed as its plain string name, not a Type
+    # enum member — repr() must not crash trying to access '.value' on it.
+    r = repr(KernelArgument("s", True, "MyStruct"))
+    assert "s" in r
+    assert "MyStruct" in r
+
+
+# ---------------------------------------------------------------------------
+# import_kernel — supported_backends
+# ---------------------------------------------------------------------------
+
+def test_default_backends_is_cpu_only():
+    fn = import_kernel("k", [KernelArgument("x", True, Type.Int)])
+    assert fn.__kernel_backends__ == [Backend.CPU]
+
+
+def test_explicit_cpu_and_goopax_backends():
+    fn = import_kernel("k", [KernelArgument("x", True, Type.Int)], [CPU, GOOPAX])
+    assert fn.__kernel_backends__ == [Backend.CPU, Backend.GOOPAX]
+
+
+def test_goopax_only_backend():
+    fn = import_kernel("k", [KernelArgument("x", True, Type.Int)], [GOOPAX])
+    assert fn.__kernel_backends__ == [Backend.GOOPAX]
+
+
+def test_bare_cpu_goopax_aliases_are_backend_members():
+    assert CPU is Backend.CPU
+    assert GOOPAX is Backend.GOOPAX

@@ -5,7 +5,7 @@ from pysol import Array, KernelArgument, Type, import_kernel, pysol, pysol_compi
 
 
 @pysol
-def hello_world():
+def solve3d():
     # ── kernel imports ────────────────────────────────────────────────────────
     hello_world_k = import_kernel("hello_world_k", [])
 
@@ -36,10 +36,11 @@ def hello_world():
             for k in range(lb):
                 init_el_k(i, j, k, A[i][j][k])
     hello_world_k()
+    pysol_update_array(A, 0, A, 1)
     for i in range(nb):
         for j in range(mb):
             for k in range(lb):
-                print_el_k(i, j, k, A[i][j][k])
+                print_el_k(i, j, k, A[1, i][j][k])
 
 if __name__ == "__main__":
     load_config("config.json")
@@ -58,5 +59,5 @@ if __name__ == "__main__":
     #pysol_run("hello_world")
 
     print("==========SOLVER============")
-    pysol_compile("hello_world")
-    pysol_run("hello_world")
+    pysol_compile("solve3d")
+    pysol_run("solve3d")
