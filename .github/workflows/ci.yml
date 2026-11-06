@@ -8,7 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): newer Ubuntu runner images (e.g. 26.04) no
+    # longer have prebuilt Python 3.8/3.9 in actions/setup-python's cache,
+    # which breaks the older end of the matrix below. ubuntu-22.04 still
+    # has all of 3.8-3.12 available.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
